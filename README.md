@@ -9,6 +9,12 @@ The engine owns the backup/restore/scheduling logic and consumes the host applic
 through a small set of interfaces (`BackupConfig`, `ScheduledBackupScheduler`) — it never
 imports host code, holds no secrets, and creates no DataStore of its own.
 
+**Docs for agents & integrators:**
+- **[`INTEGRATION.md`](INTEGRATION.md)** — step-by-step checklist to adopt the engine in a new app.
+- **[`API.md`](API.md)** — the full public surface (`BackupConfig`, `BackupRepository`, result types) and extension points.
+- **[`CLAUDE.md`](CLAUDE.md)** — the reuse invariants and the (human-gated) tag → JitPack → repin flow.
+- Reference wiring: [`CalTracker`](https://github.com/Ygaray/CalTracker_Android) is the first consumer.
+
 ## Install (JitPack)
 
 Add the JitPack repository in your **`settings.gradle.kts`** (inside
@@ -42,14 +48,20 @@ never creates its own):
 ```kotlin
 class MyBackupConfig @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val dataStore: DataStore<Preferences>,
+    override val dataStore: DataStore<Preferences>,   // the host's EXISTING store — reused, not recreated
 ) : BackupConfig {
-    override val databaseFile: File get() = context.getDatabasePath("myapp.db")
-    override val backupNamePrefix: String get() = "myapp"
-    override val dataStore: DataStore<Preferences> get() = dataStore
-    // …remaining BackupConfig members (Drive folder name, prefs keys, etc.)
+    override val appName: String = "myapp"                                 // filename prefix
+    override val databaseFile: File = context.getDatabasePath("myapp.db")  // the live Room DB
+    override val currentSchemaVersion: Int = 1                             // Room schema guard ceiling
+    // Drive folder name, marker key, retention count, restartApp, and driveAccessToken() are all
+    // DEFAULTED — override driveAccessToken() only if you support Drive backups. See API.md.
 }
 ```
+
+> Only **four** `BackupConfig` members are required (`appName`, `databaseFile`,
+> `currentSchemaVersion`, `dataStore`). The full member table and every entry point is in
+> **[`API.md`](API.md)**; the end-to-end wiring (Hilt bind, manifest Initializer, scheduling) is in
+> **[`INTEGRATION.md`](INTEGRATION.md)**.
 
 For scheduled backups, implement `ScheduledBackupScheduler` (a WorkManager-backed
 implementation lives in the consuming app; the engine ships the `BackupWorker`
