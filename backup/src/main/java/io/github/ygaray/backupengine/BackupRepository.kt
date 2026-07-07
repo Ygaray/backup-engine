@@ -1,0 +1,438 @@
+package io.github.ygaray.backupengine
+
+import android.content.Context
+import android.util.Log
+import io.github.ygaray.backupengine.di.DriveSource
+import io.github.ygaray.backupengine.drive.DriveException
+import io.github.ygaray.backupengine.model.BackupRef
+import io.github.ygaray.backupengine.model.BackupResult
+import io.github.ygaray.backupengine.model.DriveBackupResult
+import io.github.ygaray.backupengine.settings.BackupSettingsStore
+import io.github.ygaray.backupengine.source.BackupSource
+import io.github.ygaray.backupengine.source.FolderUnavailableException
+import io.github.ygaray.backupengine.startup.RestoreSwapInitializer
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * The single orchestration seam of the `:backup` engine — the one class both the ViewModel (Plan 06)
+ * and a future scheduled Worker (Phase 18) call for BOTH flows (BAK-02, BAK-04, RST-01, RST-03).
+ *
+ * It composes the already-tested primitives — [DatabaseFileManager] (snapshot/validate/swap paths),
+ * [BackupSource] (the local/Drive destination), and [BackupSettingsStore] (durable status + the
+ * pending-restore hand-off) — into two suspend flows and returns a fixed [BackupResult]. It NEVER
+ * throws across the `:app` <-> `:backup` boundary: every failure maps to a [BackupResult.Failure]
+ * reason the ViewModel turns into fixed copy, so no exception text reaches the UI (T-15-11, D-06).
+ *
+ * Consumes ONLY the injected [BackupConfig] interface — no `com.caltracker.app` type crosses in
+ * (LIB-01/LIB-02); the host binds the concrete config in Plan 05.
+ */
+@Singleton
+open class BackupRepository @Inject constructor(
+    @param:ApplicationContext private val context: Context,
+    private val config: BackupConfig,
+    private val fileManager: DatabaseFileManager,
+    private val source: BackupSource,
+    @param:DriveSource private val driveSource: BackupSource,
+    private val settings: BackupSettingsStore,
+) {
+
+    /**
+     * BACKUP flow (BAK-02, BAK-04): snapshot the live DB to a checkpointed single file, [BackupSource.put]
+     * it into the destination under a collision-free timestamped name, verify, and record the result.
+     *
+     * Guarded end-to-end (the app's `SetupViewModel` guarded-emit pattern): ANY throwable — a source
+     * write failure, a folder-unavailable, an I/O error — is caught, recorded as a failure, and mapped
+     * to a fixed [BackupResult.Failure] reason. This method NEVER rethrows (T-15-11).
+     */
+    suspend fun backup(): BackupResult = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        // WR-02: hoist temp out of the try so a `finally` can always reclaim it — a failed source.put
+        // must not leak a full-size snapshot-*.db in backup-temp.
+        val temp = File(tempDir(), "snapshot-$now.db")
+        try {
+            val snapped = fileManager.snapshot(config.databaseFile, temp)
+            if (!snapped) {
+                settings.recordLocalBackupResult(now, ok = false)
+                return@withContext BackupResult.Failure(BackupResult.Reason.WriteFailed)
+            }
+
+            val name = backupName(now)
+            val written = source.put(temp, name)
+
+            settings.recordLocalBackupResult(now, ok = true)
+            // Retention (SCH-04, D-01c): prune AFTER the verified success is recorded. WR-01: exclude the
+            // just-written ref by IDENTITY, not by positional index 0 — SAF `lastModified()` granularity can
+            // tie the fresh file with a same-second existing one, and on a tie the new file is not guaranteed
+            // to sort to index 0, so a positional `drop(keepN)` could delete the file we just wrote. A prune
+            // failure surfaces loudly and must NOT roll back the recorded success (D-01b guard 3).
+            prune(source, config.retentionCount, written)
+            BackupResult.Success
+        } catch (e: FolderUnavailableException) {
+            // A missing/un-granted SAF destination is its own fixed reason, still never rethrown.
+            settings.recordLocalBackupResult(now, ok = false)
+            BackupResult.Failure(BackupResult.Reason.FolderUnavailable)
+        } catch (e: Throwable) {
+            settings.recordLocalBackupResult(now, ok = false)
+            BackupResult.Failure(BackupResult.Reason.WriteFailed)
+        } finally {
+            // WR-02: always reclaim the temp snapshot — on success, on a failed put, on any throw.
+            temp.delete()
+        }
+    }
+
+    /**
+     * BACKUP-TO-DRIVE flow (BAK-03): the Drive twin of [backup]. Mirrors its guarded structure exactly
+     * — hoist the temp, `finally { temp.delete() }`, record per-destination status, never rethrow —
+     * but writes to the Drive destination and returns the richer [DriveBackupResult] so the ViewModel
+     * can pick the exact fixed Snackbar (401 re-auth vs no-network vs verify-mismatch vs generic).
+     *
+     * ANY [DriveException] is caught and its `kind` mapped to a [DriveBackupResult.Reason]
+     * (Unauthorized→NeedsReauth, Network→NoNetwork, VerifyMismatch→VerifyFailed, else→Failed); any
+     * other throwable maps to [DriveBackupResult.Reason.Failed]. This method NEVER rethrows across the
+     * `:app` <-> `:backup` boundary (T-17-06) and no wire text crosses in the result.
+     *
+     * Reuses [backupName] verbatim (BAK-04 same-minute guard) — but scoped to the DRIVE listing so a
+     * Drive collision guard reads Drive names, not local ones.
+     */
+    suspend fun backupToDrive(): DriveBackupResult = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        // Mirror backup()'s hoist-out-of-try so `finally` always reclaims the snapshot temp.
+        val temp = File(tempDir(), "snapshot-drive-$now.db")
+        try {
+            val snapped = fileManager.snapshot(config.databaseFile, temp)
+            if (!snapped) {
+                settings.recordDriveBackupResult(now, ok = false)
+                return@withContext DriveBackupResult.Failure(DriveBackupResult.Reason.Failed)
+            }
+
+            val written = driveSource.put(temp, driveBackupName(now))
+
+            settings.recordDriveBackupResult(now, ok = true)
+            // Retention (SCH-04, D-01c): prune the DRIVE listing after the verified success, same
+            // post-put/no-rollback contract as the local path. WR-01: exclude the just-written ref by
+            // identity rather than positional index 0 (see backup() for the tie-ordering rationale).
+            prune(driveSource, config.retentionCount, written)
+            DriveBackupResult.Success
+        } catch (e: DriveException) {
+            settings.recordDriveBackupResult(now, ok = false)
+            DriveBackupResult.Failure(e.kind.toDriveReason())
+        } catch (e: Throwable) {
+            settings.recordDriveBackupResult(now, ok = false)
+            DriveBackupResult.Failure(DriveBackupResult.Reason.Failed)
+        } finally {
+            temp.delete()
+        }
+    }
+
+    /**
+     * LIST-DRIVE-BACKUPS (RST-02): the marked Drive folder's backups, newest-first (the client already
+     * sorts). Guarded — a network/token failure yields an EMPTY list the VM renders as empty/failed,
+     * never a crash (T-17-08). Mirrors the `runCatching{}.getOrDefault(emptyList())` guard the same
+     * `backupName` collision check already uses on the local listing.
+     */
+    suspend fun listDriveBackups(): List<BackupRef> = withContext(Dispatchers.IO) {
+        runCatching { driveSource.list() }.getOrDefault(emptyList())
+    }
+
+    /**
+     * RESTORE flow (RST-01, RST-03): fetch the candidate, VALIDATE it (integrity + `user_version`
+     * ceiling) BEFORE touching anything, then — only on a pass — take a safety-copy of the live DB,
+     * stage the validated file, arm the pending-restore hand-off (both the durable [BackupSettingsStore]
+     * status AND the plain marker/paths the pre-Hilt [RestoreSwapInitializer] reads), and request a
+     * restart so the cold-start Initializer applies the swap.
+     *
+     * Refusal-before-staging (T-15-09): a newer-schema or corrupt candidate returns a
+     * [BackupResult.Failure] with NOTHING staged, flagged, or restarted. Never rethrows.
+     *
+     * The LOCAL path fetches from [source]; the DRIVE restore ([restoreFromDrive]) fetches from
+     * [driveSource] and then feeds this SAME validate→safety-copy→swap→restart engine (D-04b) — one
+     * restore path, no second implementation.
+     */
+    suspend fun restore(ref: BackupRef): BackupResult = restoreFrom(source, ref)
+
+    /**
+     * DRIVE RESTORE (RST-02, D-04b): download the chosen Drive [ref] and feed it to the UNCHANGED
+     * Phase-15 restore engine. Byte-for-byte the same validate→safety-copy→swap→restart flow as the
+     * local [restore] — only the fetch source differs. A corrupt/newer-schema downloaded `.db` is
+     * refused with live data untouched (T-17-05).
+     */
+    suspend fun restoreFromDrive(ref: BackupRef): BackupResult = restoreFrom(driveSource, ref)
+
+    /**
+     * The shared restore engine (D-04b) both [restore] (local) and [restoreFromDrive] converge on.
+     * Only the [fetchSource] differs; the validate→safety-copy→swap→restart body below is identical
+     * for every destination, so there is exactly one restore path.
+     */
+    private suspend fun restoreFrom(fetchSource: BackupSource, ref: BackupRef): BackupResult = withContext(Dispatchers.IO) {
+        // PHASE 1 — fetch + validate. A failure HERE genuinely means an unusable/absent candidate:
+        // a FolderUnavailableException maps to FolderUnavailable, anything else to NotAValidBackup
+        // (WR-01). This is the only phase where NotAValidBackup is a correct verdict.
+        val candidate = try {
+            fetchSource.get(ref)
+        } catch (e: FolderUnavailableException) {
+            return@withContext BackupResult.Failure(BackupResult.Reason.FolderUnavailable)
+        } catch (e: Throwable) {
+            return@withContext BackupResult.Failure(BackupResult.Reason.NotAValidBackup)
+        }
+
+        // GATE FIRST: integrity + schema ceiling. A refusal returns before any state changes.
+        val refusal = runCatching { fileManager.validate(candidate, config.currentSchemaVersion) }
+            .getOrDefault(BackupResult.Failure(BackupResult.Reason.NotAValidBackup))
+        if (refusal != null) {
+            candidate.delete()
+            return@withContext refusal
+        }
+
+        // PHASE 2 — post-validate staging. The candidate is PROVEN valid here (WR-01): a safety-copy,
+        // stage, arm, or restart failure is a WriteFailed, NEVER a mislabeled NotAValidBackup.
+        try {
+            val liveDb = config.databaseFile
+            val stagedPath = liveDb.path + RestoreSwapInitializer.STAGED_SUFFIX
+            val safetyPath = liveDb.path + RestoreSwapInitializer.SAFETY_SUFFIX
+            val markerFile = File(liveDb.path + RestoreSwapInitializer.MARKER_SUFFIX)
+
+            // 1. Safety-copy the live DB (the Initializer's rollback source).
+            liveDb.copyTo(File(safetyPath), overwrite = true)
+            // 2. Stage the validated candidate at the deterministic staged path.
+            candidate.copyTo(File(stagedPath), overwrite = true)
+            candidate.delete()
+            // 3. Arm the hand-off: durable status keys (ViewModel surface) AND the plain marker the
+            //    pre-Hilt Initializer reads at cold start (it cannot touch DataStore).
+            settings.setPendingRestore(stagedPath, safetyPath)
+            markerFile.writeText("pending")
+
+            // 4. Relaunch so the cold-start Initializer performs the swap on a closed DB file. On the
+            //    happy path restartApp exits the process and never returns. A `false` return means no
+            //    launch intent was available (WR-04): the swap is staged but NOT applied, so report
+            //    WriteFailed rather than a false Success that strands the "reopening…" interstitial.
+            val restarting = config.restartApp(context)
+            if (!restarting) {
+                return@withContext BackupResult.Failure(BackupResult.Reason.WriteFailed)
+            }
+            BackupResult.Success
+        } catch (e: FolderUnavailableException) {
+            BackupResult.Failure(BackupResult.Reason.FolderUnavailable)
+        } catch (e: Throwable) {
+            // Past validate() the candidate IS valid; a staging/copy/restart failure is a write failure.
+            BackupResult.Failure(BackupResult.Reason.WriteFailed)
+        }
+    }
+
+    /**
+     * Reconcile the durable restore hand-off ONCE the app is back up after a swap (CR-01/IN-04).
+     *
+     * The pre-Hilt [RestoreSwapInitializer] consumes and deletes only the plain marker file at cold
+     * start — it cannot touch DataStore. So after a completed swap the durable channels are left
+     * desynced: `RESTORE_PENDING` stays `true` forever and the full-size `.safety` copy (and any
+     * leftover `.staged`) of the live DB is never reclaimed, silently doubling on-disk footprint per
+     * restore. This wires the previously-orphaned [BackupSettingsStore.clearPendingRestore] surface
+     * (IN-04) into a real post-Hilt call site (the ViewModel init).
+     *
+     * Contract:
+     *  - Fires ONLY when a restore is pending (`restorePending == true`) AND the marker file is GONE
+     *    (== the swap already ran at cold start). While the marker is still present the swap is armed
+     *    but not yet applied, so this is a strict no-op — it must never clear the flag or delete the
+     *    staged/safety siblings out from under a pending swap.
+     *  - Idempotent: a second call after a clean reconcile does nothing.
+     *  - Fully guarded: no exception crosses the boundary (the same never-throw posture as the two
+     *    orchestration flows). A failed cleanup leaves the durable state untouched for a later retry.
+     */
+    suspend fun reconcilePendingRestore() {
+        runCatching {
+            val liveDb = config.databaseFile
+            val marker = File(liveDb.path + RestoreSwapInitializer.MARKER_SUFFIX)
+            // Marker present == swap still armed/pending -> do NOT tear down the hand-off.
+            if (!settings.restorePending.first() || marker.exists()) return
+            // Swap completed at cold start: reclaim the durable copies and clear the flag.
+            File(liveDb.path + RestoreSwapInitializer.SAFETY_SUFFIX).delete()
+            File(liveDb.path + RestoreSwapInitializer.STAGED_SUFFIX).delete()
+            settings.clearPendingRestore()
+        }.onFailure {
+            // WR-02: keep the never-throw posture, but do NOT swallow silently — a partial teardown
+            // (a `.safety`/`.staged` deleted while `RESTORE_PENDING` is still true) must leave a
+            // diagnostic trail. The durable state is intentionally left untouched for a later retry.
+            Log.w(TAG, "reconcilePendingRestore failed; durable restore state left for retry", it)
+        }
+    }
+
+    /**
+     * SCHEDULED BACKUP (SCH-01/02/05, D-07a): the single entry point the background [worker.BackupWorker]
+     * calls. Dispatches on the [destination] tag to the EXISTING verified [backup] / [backupToDrive]
+     * flows — it adds NO second success path (RESEARCH Pitfall 5), so retention + status recording +
+     * the never-throw posture all come for free from the reused flows. Its job is only to translate the
+     * per-destination result into a typed [ScheduledOutcome] the worker maps to a WorkManager `Result`.
+     *
+     * LOCAL: [BackupResult.Success] → [ScheduledOutcome.Success]; any failure (WriteFailed /
+     * FolderUnavailable) → [ScheduledOutcome.Transient] (a retriable local hiccup, never a reauth).
+     *
+     * DRIVE: [DriveBackupResult.Success] → clears `needs_reauth` then [ScheduledOutcome.Success];
+     * `NeedsReauth` (401 / null token) → persists `needs_reauth = true` then [ScheduledOutcome.NeedsReauth];
+     * `NoNetwork` → [ScheduledOutcome.NoNetwork]; `Failed` / `VerifyFailed` → [ScheduledOutcome.Transient].
+     *
+     * `needs_reauth` is written ONLY on the `NeedsReauth` branch (D-07a) — a mid-flight network drop
+     * (`NoNetwork`) or a generic failure can never masquerade as a revoked grant. An unknown destination
+     * tag maps to [ScheduledOutcome.Transient] (the worker bounds retries), never a crash.
+     */
+    open suspend fun runScheduledBackup(destination: String): ScheduledOutcome = when (destination) {
+        DESTINATION_LOCAL -> when (backup()) {
+            is BackupResult.Success -> ScheduledOutcome.Success
+            is BackupResult.Failure -> ScheduledOutcome.Transient
+        }
+
+        DESTINATION_DRIVE -> when (val result = backupToDrive()) {
+            is DriveBackupResult.Success -> {
+                settings.setNeedsReauth(false)
+                ScheduledOutcome.Success
+            }
+            is DriveBackupResult.Failure -> when (result.reason) {
+                DriveBackupResult.Reason.NeedsReauth -> {
+                    settings.setNeedsReauth(true)
+                    ScheduledOutcome.NeedsReauth
+                }
+                DriveBackupResult.Reason.NoNetwork -> ScheduledOutcome.NoNetwork
+                DriveBackupResult.Reason.VerifyFailed,
+                DriveBackupResult.Reason.Failed -> ScheduledOutcome.Transient
+            }
+        }
+
+        else -> ScheduledOutcome.Transient
+    }
+
+    /**
+     * COUNT-BASED RETENTION PRUNE (SCH-04, D-01/D-01b): keep the newest [keepN] backups in [source],
+     * delete the rest. Called only AFTER a verified `put()` from the [backup] / [backupToDrive] success
+     * paths (D-01c — fires after ANY successful backup, scheduled or manual).
+     *
+     * WR-01 — deterministic just-written protection: when [justWritten] is supplied, the freshly-put ref
+     * is excluded from the delete candidates by IDENTITY (`ref` equality), then the newest `keepN - 1` of
+     * the remaining files are kept and the older tail deleted. This is independent of filesystem clock
+     * resolution: SAF `lastModified()` can be second-granular, so a same-second tie between the new file
+     * and an existing one is not guaranteed to sort the new file to index 0 — a positional `drop(keepN)`
+     * could then delete the file we just wrote. Excluding by identity removes that failure mode entirely.
+     * (When [justWritten] is null — e.g. an explicit maintenance prune — the legacy positional behaviour
+     * over the newest-first listing is used.)
+     *
+     * Guards (D-01b): `require(keepN >= 1)` floor (never delete the last good backup); a no-op when the
+     * effective listing size is `<= keepN`; the source listing is already app-scoped (LocalBackupSource
+     * `caltracker-` prefix; DriveBackupSource marked folder), so the loop can never reach unrelated user
+     * files (T-18-02). A failed `delete()` PROPAGATES loudly (not swallowed) and must not roll back the
+     * already-recorded success — the caller wires this after the success write, not inside it.
+     */
+    suspend fun prune(source: BackupSource, keepN: Int, justWritten: BackupRef? = null) {
+        require(keepN >= 1) { "retention keepN must be >= 1 to preserve the last good backup" }
+        val all = source.list() // post-put listing, newest-first
+        if (justWritten == null) {
+            if (all.size <= keepN) return // no-op when at/under the window — never delete the last good backup
+            all.drop(keepN).forEach { source.delete(it) } // delete the oldest tail; a failed delete throws loudly
+            return
+        }
+        // Never a delete candidate: the just-written ref is protected by identity regardless of sort ties.
+        val others = all.filterNot { it.ref == justWritten.ref }
+        if (others.size <= keepN - 1) return // the new file + everything else already fits the window
+        others.drop(keepN - 1).forEach { source.delete(it) } // delete the oldest tail; a failed delete throws loudly
+    }
+
+    private fun tempDir(): File =
+        File(config.databaseFile.parentFile, "backup-temp").apply { mkdirs() }
+
+    /**
+     * A collision-free, timestamped backup name: `caltracker-<yyyy-MM-dd>_<HHmm>.db`, extended to
+     * `_ss` when two backups land in the same minute (UX-D-06 same-minute collision guard). The seconds
+     * suffix is only appended when a same-minute name is already present in the destination listing.
+     */
+    private suspend fun backupName(nowMillis: Long): String {
+        val prefix = config.appName
+        val minute = SimpleDateFormat("yyyy-MM-dd'_'HHmm", Locale.US).format(Date(nowMillis))
+        // WR-03: match on a PRECISE prefix (startsWith the normalized `prefix-minute` stem), not a
+        // loose substring contains(). A contains() check false-positives on longer/`.bin`-suffixed
+        // names and can match a shorter timestamp substring inside a longer one — wrongly suppressing
+        // the seconds suffix and defeating the unique-filename intent (UX-D-06).
+        val baseStem = "$prefix-$minute" // e.g. caltracker-2026-07-01_1430
+        val existing = runCatching { source.list().map { it.name } }.getOrDefault(emptyList())
+        if (existing.none { it.startsWith(baseStem) }) return "$baseStem.db"
+        val seconds = SimpleDateFormat("ss", Locale.US).format(Date(nowMillis))
+        return "${baseStem}_$seconds.db"
+    }
+
+    /**
+     * The Drive twin of [backupName] (BAK-04 same-minute guard) — identical `caltracker-<yyyy-MM-dd>_<HHmm>.db`
+     * scheme, but the same-minute collision check reads the DRIVE listing, not the local one, so a Drive
+     * backup's uniqueness is decided against Drive names. Guarded like [backupName]: a listing failure
+     * falls back to the base stem rather than throwing.
+     */
+    private suspend fun driveBackupName(nowMillis: Long): String {
+        val prefix = config.appName
+        val minute = SimpleDateFormat("yyyy-MM-dd'_'HHmm", Locale.US).format(Date(nowMillis))
+        val baseStem = "$prefix-$minute"
+        val existing = runCatching { driveSource.list().map { it.name } }.getOrDefault(emptyList())
+        if (existing.none { it.startsWith(baseStem) }) return "$baseStem.db"
+        val seconds = SimpleDateFormat("ss", Locale.US).format(Date(nowMillis))
+        return "${baseStem}_$seconds.db"
+    }
+
+    /**
+     * Map a [DriveException.Kind] to the fixed [DriveBackupResult.Reason] the ViewModel turns into copy
+     * (RESEARCH L413-425 / T-17-06). Only the fixed category crosses — never any wire text:
+     *  - [DriveException.Kind.Unauthorized] (401 / null token) → [DriveBackupResult.Reason.NeedsReauth]
+     *  - [DriveException.Kind.Network] (transport IOException) → [DriveBackupResult.Reason.NoNetwork]
+     *  - [DriveException.Kind.VerifyMismatch] (md5/size) → [DriveBackupResult.Reason.VerifyFailed]
+     *  - everything else (403 quota / 404 / 5xx) → [DriveBackupResult.Reason.Failed]
+     */
+    private fun DriveException.Kind.toDriveReason(): DriveBackupResult.Reason = when (this) {
+        DriveException.Kind.Unauthorized -> DriveBackupResult.Reason.NeedsReauth
+        DriveException.Kind.Network -> DriveBackupResult.Reason.NoNetwork
+        DriveException.Kind.VerifyMismatch -> DriveBackupResult.Reason.VerifyFailed
+        DriveException.Kind.RateLimited,
+        DriveException.Kind.NotFound,
+        DriveException.Kind.Server -> DriveBackupResult.Reason.Failed
+    }
+
+    companion object {
+        private const val TAG = "BackupRepository"
+
+        /**
+         * The destination tags [runScheduledBackup] dispatches on, shared with the worker and the
+         * scheduler so the input-data contract is defined in exactly one place (no stringly-typed
+         * drift between producer and consumer).
+         */
+        const val DESTINATION_LOCAL = "LOCAL"
+        const val DESTINATION_DRIVE = "DRIVE"
+    }
+}
+
+/**
+ * The typed outcome of a [BackupRepository.runScheduledBackup] run (SCH-05, D-07a/D-07b).
+ *
+ * A [sealed interface] so the [worker.BackupWorker] maps every variant onto a WorkManager `Result`
+ * in an exhaustive `when` with no `else`. Deliberately UI-free and framework-free (no `androidx.work`
+ * type here) so it lives in the reusable engine (LIB-01):
+ *
+ *  - [Success]: the backup completed and verified → the worker returns `Result.success()`.
+ *  - [NeedsReauth]: a Drive 401 / null-token — the grant must be re-authorized; `needs_reauth` has been
+ *    persisted → the worker returns terminal `Result.failure()` (no retry can fix a revoked grant, D-07b).
+ *  - [NoNetwork]: a transport failure → the worker returns `Result.retry()` (exponential backoff).
+ *  - [Transient]: any other retriable failure → the worker retries up to a bounded attempt count,
+ *    then `Result.failure()` (D-07b — no infinite battery-draining retry loop).
+ */
+sealed interface ScheduledOutcome {
+    /** The scheduled backup completed and was verified. */
+    data object Success : ScheduledOutcome
+
+    /** A Drive 401 / null-token: the grant must be re-authorized (terminal for the worker). */
+    data object NeedsReauth : ScheduledOutcome
+
+    /** A transport / no-network failure: retriable with backoff. */
+    data object NoNetwork : ScheduledOutcome
+
+    /** Any other retriable failure: bounded retry then terminal failure. */
+    data object Transient : ScheduledOutcome
+}
