@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
+import io.github.ygaray.backupengine.BackupConfig
 import io.github.ygaray.backupengine.model.BackupRef
 import io.github.ygaray.backupengine.settings.BackupSettingsStore
 import kotlinx.coroutines.Dispatchers
@@ -36,6 +37,7 @@ import java.io.File
 open class LocalBackupSource(
     private val context: Context,
     private val settings: BackupSettingsStore,
+    private val config: BackupConfig,
 ) : BackupSource {
 
     /**
@@ -163,20 +165,25 @@ open class LocalBackupSource(
     private fun stagingDir(): File =
         File(context.cacheDir, "backup-staging").apply { mkdirs() }
 
+    /**
+     * A backup file name is `<appName>-<timestamp>.db` (BAK-04 scheme). We match on the
+     * config-driven `<appName>-` prefix and the presence of `.db` rather than an exact `.db` SUFFIX
+     * because SAF's `DocumentFile.createFile` may append a MIME-derived extension (e.g. producing
+     * `caltracker-….db.bin` from `application/octet-stream`) — a documented SAF quirk (Pitfall 14).
+     * Matching the stable prefix + `.db` marker keeps the listing correct regardless.
+     *
+     * **ENG-02 / D-02a / D-02b:** the prefix derives from [config].appName (aligning to
+     * [io.github.ygaray.backupengine.BackupRepository.backupName]'s `config.appName` source of truth),
+     * NOT a hardcoded `"caltracker-"`. For CalTracker's `appName == "caltracker"` this yields
+     * `"caltracker" + "-" == "caltracker-"` — BYTE-IDENTICAL to the v1.0.0 hardcoded PREFIX, so every
+     * existing `caltracker-*.db` backup stays recognized/listed/restorable.
+     */
+    internal fun isBackupName(name: String): Boolean =
+        name.startsWith(config.appName + "-") && name.contains(DB_MARKER)
+
     companion object {
         private const val MIME_DB = "application/octet-stream"
-        private const val PREFIX = "caltracker-"
         private const val DB_MARKER = ".db"
-
-        /**
-         * A backup file name is `caltracker-<timestamp>.db` (BAK-04 scheme). We match on the
-         * `caltracker-` prefix and the presence of `.db` rather than an exact `.db` SUFFIX because
-         * SAF's `DocumentFile.createFile` may append a MIME-derived extension (e.g. producing
-         * `caltracker-….db.bin` from `application/octet-stream`) — a documented SAF quirk (Pitfall
-         * 14). Matching the stable prefix + `.db` marker keeps the listing correct regardless.
-         */
-        internal fun isBackupName(name: String): Boolean =
-            name.startsWith(PREFIX) && name.contains(DB_MARKER)
     }
 }
 

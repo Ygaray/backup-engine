@@ -49,7 +49,8 @@ object BackupModule {
     fun provideBackupSource(
         @ApplicationContext context: Context,
         settings: BackupSettingsStore,
-    ): BackupSource = LocalBackupSource(context, settings)
+        config: BackupConfig,
+    ): BackupSource = LocalBackupSource(context, settings, config)
 
     // ---- Phase 17: Drive networking + Drive source (LIB-01 — from BackupConfig alone) ----
 
