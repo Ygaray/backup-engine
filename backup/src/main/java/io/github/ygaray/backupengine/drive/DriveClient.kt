@@ -268,11 +268,29 @@ open class DriveClient(
      * Run [request] synchronously and hand a SUCCESSFUL [Response] to [onSuccess]. Non-2xx status →
      * [DriveException.fromStatus]; an `IOException` (transport) → [DriveException.Network]. Neither the
      * body, `resp.message`, nor the token is ever placed in the thrown exception (T-17-01/02).
+     *
+     * The 2xx body is UNTRUSTED (T-22-09/T-22-10, Pitfall 3): [onSuccess] reads/streams the body, so a
+     * mid-body transport drop throws an [IOException] DEEP inside the lambda — OUTSIDE [runCall]'s try —
+     * and a truncated/non-JSON body throws an [org.json.JSONException] on parse. Both are guarded here:
+     * an `IOException` → [DriveException.Network] (transport), a `JSONException` → [DriveException.Malformed]
+     * (a 2xx body that failed to parse, DISTINCT from `NotAValidBackup`). The catches are SPECIFIC (not a
+     * broad `Exception`) so a mid-body drop stays [Kind.Network], never mislabeled [Kind.Malformed]. The
+     * raw status is logged INTERNALLY only — never the token/body/`resp.message`, and never into the thrown
+     * exception (whose message stays `kind.name`).
      */
     private fun <T> execute(request: Request, onSuccess: (Response) -> T): T {
         runCall(request).use { resp ->
             if (!resp.isSuccessful) throw DriveException.fromStatus(resp.code)
-            return onSuccess(resp)
+            return try {
+                onSuccess(resp)
+            } catch (io: IOException) {
+                // A mid-body transport drop during the body read/stream (Pitfall 3) — transport failure.
+                throw DriveException.Network
+            } catch (json: org.json.JSONException) {
+                // A 2xx response whose body could not be parsed (ENG-03) — coarse typed Malformed, not a raw crash.
+                android.util.Log.w(TAG, "Drive 2xx body failed to parse (status ${resp.code})")
+                throw DriveException.Malformed
+            }
         }
     }
 
@@ -285,6 +303,7 @@ open class DriveClient(
         }
 
     companion object {
+        private const val TAG = "DriveClient"
         private val JSON_MEDIA = "application/json; charset=UTF-8".toMediaType()
     }
 }
