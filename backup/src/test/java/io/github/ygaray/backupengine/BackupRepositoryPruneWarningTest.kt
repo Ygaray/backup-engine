@@ -60,7 +60,14 @@ class BackupRepositoryPruneWarningTest {
     fun setUp() {
         val ctx = ApplicationProvider.getApplicationContext<android.content.Context>()
         scratch = File(ctx.cacheDir, "prune-warn-${System.nanoTime()}").apply { mkdirs() }
-        val liveDb = File(scratch, "caltracker.db").apply { writeText("db") }
+        // A REAL SQLite live DB (not a "db" text stub): backup() runs DatabaseFileManager.snapshot(),
+        // which opens the source with SQLiteDatabase — a non-SQLite file would throw there and short-
+        // circuit to WriteFailed BEFORE the post-success prune under test ever runs. Seed a valid DB so
+        // the flow reaches the prune step (mirrors BackupRepositoryDriveTest.seedDb).
+        val liveDb = File(scratch, "caltracker.db")
+        android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(liveDb, null).use { h ->
+            h.execSQL("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY)")
+        }
         source = FakeBackupSource()
         driveSource = FakeBackupSource()
         settings = BackupSettingsStore(InMemoryDataStore())
