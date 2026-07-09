@@ -37,6 +37,14 @@ class DriveException private constructor(
 
         /** The uploaded file's server md5/size did not match the local file (D-02a). */
         VerifyMismatch,
+
+        /**
+         * A 2xx Drive response whose body could not be parsed (e.g. malformed/empty JSON) — the call
+         * succeeded at the HTTP layer but the payload was unusable (ENG-03 / D-03). DISTINCT from
+         * [io.github.ygaray.backupengine.model.BackupResult.Reason.NotAValidBackup], which is a
+         * restore-side integrity verdict from `validate()`, not a Drive response-parse failure.
+         */
+        Malformed,
     }
 
     companion object {
@@ -63,5 +71,8 @@ class DriveException private constructor(
 
         /** The D-02a upload verification failed (md5 or size mismatch). */
         val VerifyMismatch: DriveException get() = DriveException(Kind.VerifyMismatch)
+
+        /** A 2xx response with an unparseable body (ENG-03 / D-03) — parsed by [DriveClient]'s guard. */
+        val Malformed: DriveException get() = DriveException(Kind.Malformed)
     }
 }

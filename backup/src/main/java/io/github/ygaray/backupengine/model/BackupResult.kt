@@ -10,8 +10,17 @@ package io.github.ygaray.backupengine.model
  */
 sealed interface BackupResult {
 
-    /** The operation completed successfully. */
-    data object Success : BackupResult
+    /**
+     * The operation completed successfully.
+     *
+     * [pruneWarning] is an ADDITIVE, non-fatal signal (ENG-01 / D-01): a backup that was written and
+     * verified stays a [Success] even when the post-success retention prune throws. The throw is
+     * caught and surfaced as this fixed [PruneWarning] marker so the ViewModel can note that cleanup
+     * failed — it NEVER flips the verified success to a [Failure] and NEVER carries any exception text
+     * (T-15-11). Defaults to `null` (no prune problem), so every existing `Success()` construction and
+     * every `is BackupResult.Success` when-branch is unaffected (semver-safe MINOR bump).
+     */
+    data class Success(val pruneWarning: PruneWarning? = null) : BackupResult
 
     /** The operation was refused or failed; [reason] selects the fixed user-facing copy. */
     data class Failure(val reason: Reason) : BackupResult
@@ -32,3 +41,14 @@ sealed interface BackupResult {
         FolderUnavailable,
     }
 }
+
+/**
+ * A fixed, non-fatal marker that the post-success retention prune FAILED (ENG-01 / D-01 / T-15-11).
+ *
+ * Carried on a [BackupResult.Success] / [DriveBackupResult.Success] when a backup was written and
+ * verified but the housekeeping prune afterward threw. It is deliberately a value-free `data object`:
+ * it MUST NOT carry the prune exception, its message, or any wire/stack text — only the fact that
+ * cleanup did not complete. The ViewModel maps its mere presence to fixed copy; nothing from the
+ * exception ever reaches the UI (T-15-11, ASVS V7). Shared by both result types.
+ */
+data object PruneWarning

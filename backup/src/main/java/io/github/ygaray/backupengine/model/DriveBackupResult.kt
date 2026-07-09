@@ -18,8 +18,16 @@ package io.github.ygaray.backupengine.model
  */
 sealed interface DriveBackupResult {
 
-    /** The Drive backup completed and was md5/size-verified. */
-    data object Success : DriveBackupResult
+    /**
+     * The Drive backup completed and was md5/size-verified.
+     *
+     * [pruneWarning] mirrors [BackupResult.Success.pruneWarning] (ENG-01 / D-01): a verified Drive
+     * backup stays a [Success] even when the post-success retention prune throws — the throw is caught
+     * and surfaced as this fixed [PruneWarning] marker, never a [Failure], never any exception text
+     * (T-15-11). Defaults to `null`, so every existing `Success()` construction and `is
+     * DriveBackupResult.Success` when-branch is unaffected (semver-safe MINOR bump).
+     */
+    data class Success(val pruneWarning: PruneWarning? = null) : DriveBackupResult
 
     /** The Drive backup was refused or failed; [reason] selects the fixed user-facing copy. */
     data class Failure(val reason: Reason) : DriveBackupResult
