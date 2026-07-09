@@ -178,8 +178,17 @@ open class DriveClient(
                 .addQueryParameter("alt", "media")
                 .build()
             val dest = File(stagingDir(), name.ifBlank { "restore-${System.currentTimeMillis()}.db" })
-            execute(Request.Builder().url(url).bearer(token).get().build()) { resp ->
-                resp.body!!.source().use { src -> dest.sink().buffer().use { it.writeAll(src) } }
+            try {
+                execute(Request.Builder().url(url).bearer(token).get().build()) { resp ->
+                    resp.body!!.source().use { src -> dest.sink().buffer().use { it.writeAll(src) } }
+                }
+            } catch (t: Throwable) {
+                // A failed/interrupted transfer (e.g. a mid-body IOException mapped to Network by execute())
+                // must not orphan a partial file in backup-staging/ (ENG-04 / D-04). Catch-delete-rethrow —
+                // NOT a finally, which would also delete the good file on the success path (mirrors
+                // BackupRepository.backup()'s finally-reclaim, adapted so the success path returns dest).
+                dest.delete()
+                throw t
             }
             dest
         }
