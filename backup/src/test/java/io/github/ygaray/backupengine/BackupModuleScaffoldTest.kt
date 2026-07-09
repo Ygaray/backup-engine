@@ -27,7 +27,7 @@ class BackupModuleScaffoldTest {
     @Test
     fun everyBackupResultVariantMapsToADistinctNonBlankLabel() {
         val variants: List<BackupResult> = listOf(
-            BackupResult.Success,
+            BackupResult.Success(),
             BackupResult.Failure(BackupResult.Reason.SchemaTooNew),
             BackupResult.Failure(BackupResult.Reason.NotAValidBackup),
             BackupResult.Failure(BackupResult.Reason.WriteFailed),
@@ -41,6 +41,6 @@ class BackupModuleScaffoldTest {
         // ...and every label is distinct (no two variants collapse to the same string).
         assertEquals("labels must be distinct", labels.size, labels.toSet().size)
         // One concrete anchor so the exhaustiveness is exercised, not just compiled.
-        assertEquals("success", label(BackupResult.Success))
+        assertEquals("success", label(BackupResult.Success()))
     }
 }

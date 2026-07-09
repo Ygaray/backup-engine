@@ -73,7 +73,7 @@ class BackupRepositoryTest {
     fun `backup snapshots puts verifies and records success`() = runBlocking {
         val result = repo.backup()
 
-        assertEquals(BackupResult.Success, result)
+        assertEquals(BackupResult.Success(), result)
         assertEquals(1, source.put.size)
         assertTrue("put name follows the caltracker- scheme", source.put.first().second.startsWith("caltracker-"))
         assertTrue("a success result was recorded", settings.readOk() == true)
@@ -97,7 +97,7 @@ class BackupRepositoryTest {
 
         val result = repo.restore(ref)
 
-        assertEquals(BackupResult.Success, result)
+        assertEquals(BackupResult.Success(), result)
         assertTrue("staged file written for the Initializer", stagedFile().exists())
         assertTrue("safety copy of the live DB taken", safetyFile().exists())
         assertTrue("plain pending marker written", markerFile().exists())
@@ -188,7 +188,7 @@ class BackupRepositoryTest {
     @Test
     fun `a successful restore then reconcile leaves no permanent pending flag or orphaned safety`() = runBlocking {
         val ref = source.stage(seedCandidate("cand-recon.db", version = 5))
-        assertEquals(BackupResult.Success, repo.restore(ref))
+        assertEquals(BackupResult.Success(), repo.restore(ref))
         assertTrue("restore armed the pending flag", settings.restorePending.first())
 
         // Simulate the cold-start swap having run + cleared the marker.

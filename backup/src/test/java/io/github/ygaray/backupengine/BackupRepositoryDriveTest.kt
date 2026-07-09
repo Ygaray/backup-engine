@@ -67,7 +67,7 @@ class BackupRepositoryDriveTest {
     fun `backupToDrive puts a timestamped snapshot and records a Drive success`() = runBlocking {
         val result = repo.backupToDrive()
 
-        assertEquals(DriveBackupResult.Success, result)
+        assertEquals(DriveBackupResult.Success(), result)
         assertEquals(1, drive.put.size)
         assertTrue("Drive name follows the caltracker- scheme", drive.put.single().second.startsWith("caltracker-"))
         assertTrue("Drive status recorded as success", settings.readDriveOk() == true)
@@ -152,7 +152,7 @@ class BackupRepositoryDriveTest {
 
         val result = repo.restoreFromDrive(ref)
 
-        assertEquals(BackupResult.Success, result)
+        assertEquals(BackupResult.Success(), result)
         assertTrue("staged for the Initializer", File(liveDb.path + RestoreSwapInitializer.STAGED_SUFFIX).exists())
         assertTrue("safety copy taken", File(liveDb.path + RestoreSwapInitializer.SAFETY_SUFFIX).exists())
         assertTrue("pending marker written", File(liveDb.path + RestoreSwapInitializer.MARKER_SUFFIX).exists())

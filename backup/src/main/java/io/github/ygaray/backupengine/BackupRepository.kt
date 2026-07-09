@@ -7,6 +7,7 @@ import io.github.ygaray.backupengine.drive.DriveException
 import io.github.ygaray.backupengine.model.BackupRef
 import io.github.ygaray.backupengine.model.BackupResult
 import io.github.ygaray.backupengine.model.DriveBackupResult
+import io.github.ygaray.backupengine.model.PruneWarning
 import io.github.ygaray.backupengine.settings.BackupSettingsStore
 import io.github.ygaray.backupengine.source.BackupSource
 import io.github.ygaray.backupengine.source.FolderUnavailableException
@@ -72,10 +73,17 @@ open class BackupRepository @Inject constructor(
             // Retention (SCH-04, D-01c): prune AFTER the verified success is recorded. WR-01: exclude the
             // just-written ref by IDENTITY, not by positional index 0 — SAF `lastModified()` granularity can
             // tie the fresh file with a same-second existing one, and on a tie the new file is not guaranteed
-            // to sort to index 0, so a positional `drop(keepN)` could delete the file we just wrote. A prune
-            // failure surfaces loudly and must NOT roll back the recorded success (D-01b guard 3).
-            prune(source, config.retentionCount, written)
-            BackupResult.Success
+            // to sort to index 0, so a positional `drop(keepN)` could delete the file we just wrote.
+            //
+            // ENG-01 (D-01/D-01b/D-01c/T-22-04): the record-success-FIRST ordering above is load-bearing and
+            // MUST NOT be reordered. A post-success prune throw is NON-FATAL housekeeping — wrap ONLY the prune
+            // call in runCatching so its throw can NEVER unwind into the outer `catch (Throwable)` and re-record
+            // ok = false / return a Failure. It is surfaced instead as an additive, text-free PruneWarning marker
+            // on the still-Success result (T-15-11: no exception text crosses).
+            val pruneWarning = runCatching {
+                prune(source, config.retentionCount, written)
+            }.exceptionOrNull()?.let { PruneWarning }
+            BackupResult.Success(pruneWarning)
         } catch (e: FolderUnavailableException) {
             // A missing/un-granted SAF destination is its own fixed reason, still never rethrown.
             settings.recordLocalBackupResult(now, ok = false)
@@ -120,8 +128,14 @@ open class BackupRepository @Inject constructor(
             // Retention (SCH-04, D-01c): prune the DRIVE listing after the verified success, same
             // post-put/no-rollback contract as the local path. WR-01: exclude the just-written ref by
             // identity rather than positional index 0 (see backup() for the tie-ordering rationale).
-            prune(driveSource, config.retentionCount, written)
-            DriveBackupResult.Success
+            //
+            // ENG-01 (D-01/T-22-04): identical shape to backup() — record-success stays FIRST, the prune throw
+            // is caught by runCatching (never reaching the outer catch, never flipping to Failure) and surfaced
+            // as a text-free PruneWarning on the still-Success Drive result.
+            val pruneWarning = runCatching {
+                prune(driveSource, config.retentionCount, written)
+            }.exceptionOrNull()?.let { PruneWarning }
+            DriveBackupResult.Success(pruneWarning)
         } catch (e: DriveException) {
             settings.recordDriveBackupResult(now, ok = false)
             DriveBackupResult.Failure(e.kind.toDriveReason())
@@ -194,10 +208,17 @@ open class BackupRepository @Inject constructor(
 
         // PHASE 2 — post-validate staging. The candidate is PROVEN valid here (WR-01): a safety-copy,
         // stage, arm, or restart failure is a WriteFailed, NEVER a mislabeled NotAValidBackup.
+        //
+        // ENG-04 / D-04 / T-22-03: hoist the deterministic staged/safety paths out of the try so the catch
+        // blocks below can reclaim any partial `.staged`/`.safety` a mid-stage failure left behind. The
+        // cleanup lives in the CATCH ONLY — NOT a finally (Pitfall 4): the happy path calls
+        // config.restartApp() which exit(0)s before returning, so a finally would delete the freshly-armed
+        // staged/safety siblings out from under the pending cold-start swap. reconcilePendingRestore()
+        // handles the armed-but-not-yet-swapped boot case and is intentionally untouched.
+        val liveDb = config.databaseFile
+        val stagedPath = liveDb.path + RestoreSwapInitializer.STAGED_SUFFIX
+        val safetyPath = liveDb.path + RestoreSwapInitializer.SAFETY_SUFFIX
         try {
-            val liveDb = config.databaseFile
-            val stagedPath = liveDb.path + RestoreSwapInitializer.STAGED_SUFFIX
-            val safetyPath = liveDb.path + RestoreSwapInitializer.SAFETY_SUFFIX
             val markerFile = File(liveDb.path + RestoreSwapInitializer.MARKER_SUFFIX)
 
             // 1. Safety-copy the live DB (the Initializer's rollback source).
@@ -216,15 +237,39 @@ open class BackupRepository @Inject constructor(
             //    WriteFailed rather than a false Success that strands the "reopening…" interstitial.
             val restarting = config.restartApp(context)
             if (!restarting) {
+                // WR-04: no launch intent — the swap was staged but will NOT be applied, so this is a genuine
+                // stage failure. Reclaim the partial staged/safety siblings before reporting WriteFailed so no
+                // orphaned full-size copies remain (ENG-04); nothing was armed for a cold-start swap here.
+                cleanupRestoreStaging(stagedPath, safetyPath, candidate)
                 return@withContext BackupResult.Failure(BackupResult.Reason.WriteFailed)
             }
-            BackupResult.Success
+            BackupResult.Success()
         } catch (e: FolderUnavailableException) {
+            // ENG-04 (T-22-03): a mid-stage failure never armed the swap — reclaim any partial `.staged`/
+            // `.safety` (and the candidate if not yet deleted) so a failed restore strands no orphans.
+            cleanupRestoreStaging(stagedPath, safetyPath, candidate)
             BackupResult.Failure(BackupResult.Reason.FolderUnavailable)
         } catch (e: Throwable) {
             // Past validate() the candidate IS valid; a staging/copy/restart failure is a write failure.
+            // ENG-04 (T-22-03): reclaim the partial staged/safety siblings in the CATCH (never a finally,
+            // Pitfall 4) so no orphaned files remain after the failed restore.
+            cleanupRestoreStaging(stagedPath, safetyPath, candidate)
             BackupResult.Failure(BackupResult.Reason.WriteFailed)
         }
+    }
+
+    /**
+     * ENG-04 / D-04 (T-22-03): reclaim a FAILED restore-stage's partial artifacts — the deterministic
+     * `.staged`/`.safety` siblings of the live DB and the fetched [candidate] if it was not already
+     * consumed — so an interrupted restore leaves the staging area exactly as it found it. Called ONLY
+     * from the PHASE-2 catch blocks (never a finally): the happy path exits the process via
+     * `restartApp()` before returning, so this must never fire on the armed-swap path (Pitfall 4).
+     * Fully guarded — a cleanup failure must not mask the original restore failure.
+     */
+    private fun cleanupRestoreStaging(stagedPath: String, safetyPath: String, candidate: File) {
+        runCatching { File(stagedPath).delete() }
+        runCatching { File(safetyPath).delete() }
+        runCatching { if (candidate.exists()) candidate.delete() }
     }
 
     /**
@@ -385,7 +430,7 @@ open class BackupRepository @Inject constructor(
      *  - [DriveException.Kind.Unauthorized] (401 / null token) → [DriveBackupResult.Reason.NeedsReauth]
      *  - [DriveException.Kind.Network] (transport IOException) → [DriveBackupResult.Reason.NoNetwork]
      *  - [DriveException.Kind.VerifyMismatch] (md5/size) → [DriveBackupResult.Reason.VerifyFailed]
-     *  - everything else (403 quota / 404 / 5xx) → [DriveBackupResult.Reason.Failed]
+     *  - everything else (403 quota / 404 / 5xx / 2xx-malformed) → [DriveBackupResult.Reason.Failed]
      */
     private fun DriveException.Kind.toDriveReason(): DriveBackupResult.Reason = when (this) {
         DriveException.Kind.Unauthorized -> DriveBackupResult.Reason.NeedsReauth
@@ -393,6 +438,8 @@ open class BackupRepository @Inject constructor(
         DriveException.Kind.VerifyMismatch -> DriveBackupResult.Reason.VerifyFailed
         DriveException.Kind.RateLimited,
         DriveException.Kind.NotFound,
+        // ENG-03 / D-03: a 2xx response with an unparseable body is a coarse generic failure to the VM.
+        DriveException.Kind.Malformed,
         DriveException.Kind.Server -> DriveBackupResult.Reason.Failed
     }
 
