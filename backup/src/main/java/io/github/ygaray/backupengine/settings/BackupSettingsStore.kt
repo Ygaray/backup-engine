@@ -208,6 +208,36 @@ class BackupSettingsStore(
         }
     }
 
+    /**
+     * Offline-disconnect (D-03 / D-05b): clear the connected account AND arm the owed server-side
+     * revoke in ONE atomic [DataStore.edit] — the exact inverse of [setConnected]. Doing both in a
+     * single transactional edit is the whole point (AUTH-05, T-22-06): a half-cleared state (email
+     * gone but grant still true, or grant cleared but revoke never armed) would strand a still-
+     * authorized server grant that the app believes is disconnected. Clears GOOGLE_ACCOUNT_EMAIL,
+     * GOOGLE_AUTH_GRANTED, PENDING_GOOGLE_EMAIL, NEEDS_REAUTH and sets REVOKE_PENDING = true.
+     *
+     * Library-native (resolved Option A): this makes `:backup` the single owner of the auth keys so
+     * plan 22-06 can delete the app-side `AuthLocalStateStore` entirely.
+     */
+    suspend fun clearConnectedAndOweRevoke() {
+        dataStore.edit {
+            it.remove(GOOGLE_ACCOUNT_EMAIL)
+            it.remove(GOOGLE_AUTH_GRANTED)
+            it.remove(PENDING_GOOGLE_EMAIL)
+            it.remove(NEEDS_REAUTH)
+            it[REVOKE_PENDING] = true
+        }
+    }
+
+    /**
+     * Clear only the in-flight consent email (WR-01) — the inverse of [setPendingGoogleEmail], in a
+     * single [DataStore.edit]. Library-native (resolved Option A) so the app can delete its own
+     * pending-email state in plan 22-06.
+     */
+    suspend fun clearPendingGoogleEmail() {
+        dataStore.edit { it.remove(PENDING_GOOGLE_EMAIL) }
+    }
+
     /** Arm/disarm the offline "revoke pending" flag (D-03 offline disconnect path). */
     suspend fun setRevokePending(pending: Boolean) {
         dataStore.edit {
