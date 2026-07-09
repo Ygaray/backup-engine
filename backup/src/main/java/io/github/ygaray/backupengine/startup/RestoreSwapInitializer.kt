@@ -1,5 +1,6 @@
 package io.github.ygaray.backupengine.startup
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -29,8 +30,9 @@ import java.io.File
  * been attempted, and a re-run with a missing staged file simply rolls back again.
  *
  * @param databaseFileResolver resolves the live DB [File] from a [Context]. Defaults to reading the
- *   host app's manifest `<meta-data android:name="backupengine.databaseName">` value (via
- *   [readDatabaseName]) and resolving `context.getDatabasePath(...)`, falling back to
+ *   host app's `<meta-data android:name="backupengine.databaseName">` value declared on its
+ *   androidx.startup `InitializationProvider` (via [readDatabaseName], reading `ProviderInfo.metaData`
+ *   — H-01 fix, v1.1.1) and resolving `context.getDatabasePath(...)`, falling back to
  *   [DEFAULT_DB_NAME] (`"caltracker.db"`) when the meta-data is absent/null so CalTracker still
  *   resolves correctly even if it omits the declaration (ENG-02b, Pitfall 2, D-02a). Overridable so
  *   the JVM test can point the deterministic sibling paths at a scratch DB without Room/Hilt (D-02).
@@ -87,6 +89,17 @@ class RestoreSwapInitializer(
          */
         internal const val META_DATA_DB_NAME = "backupengine.databaseName"
 
+        /**
+         * The androidx.startup content-provider the consuming app declares the [META_DATA_DB_NAME]
+         * `<meta-data>` under. Because CalTracker (and the idiomatic androidx.startup placement)
+         * nests the `<meta-data>` INSIDE the `<provider android:name="androidx.startup.Initialization
+         * Provider">` block, the value lands in `ProviderInfo.metaData` — NOT `ApplicationInfo.metaData`
+         * — so [readDatabaseName] resolves it via `getProviderInfo(...)` against this component name
+         * (H-01 fix, v1.1.1). Reading `ApplicationInfo` here would always miss the provider-scoped
+         * value and silently fall through to [DEFAULT_DB_NAME], rendering the ENG-02b config inert.
+         */
+        internal const val STARTUP_PROVIDER_CLASS = "androidx.startup.InitializationProvider"
+
         // Deterministic sibling suffixes derived from the live DB path (Open Q1). BackupRepository
         // (Plan 04) writes the staged file, safety copy, and marker at these exact paths before it
         // requests the restart, and this Initializer reads them back with no shared config object.
@@ -95,24 +108,37 @@ class RestoreSwapInitializer(
         const val MARKER_SUFFIX = ".restore-pending"
 
         /**
-         * Read the host app's `<meta-data>` DB-name value from its `ApplicationInfo`, or `null` when
-         * absent/unreadable (→ caller falls back to [DEFAULT_DB_NAME]). Branches the API-33+
-         * [PackageManager.ApplicationInfoFlags] overload (the pre-33 `getApplicationInfo(String, Int)`
-         * is deprecated on 33+; the library is warnings-clean, so branch it). A missing app info
-         * ([PackageManager.NameNotFoundException]) or an absent key both resolve to `null`.
+         * Read the host app's [META_DATA_DB_NAME] `<meta-data>` value from the androidx.startup
+         * [STARTUP_PROVIDER_CLASS]'s `ProviderInfo`, or `null` when absent/unreadable (→ caller falls
+         * back to [DEFAULT_DB_NAME]).
+         *
+         * **H-01 fix (v1.1.1):** the consuming app declares the meta-data NESTED inside its
+         * `<provider android:name="androidx.startup.InitializationProvider">` block (the idiomatic
+         * androidx.startup placement), so the value populates `ProviderInfo.metaData`, NOT
+         * `ApplicationInfo.metaData`. The prior `getApplicationInfo(...)` read therefore ALWAYS
+         * returned null and the resolver silently fell through to [DEFAULT_DB_NAME] — byte-identical
+         * for CalTracker (masking the defect) but inert for any consumer whose DB name differs. Reading
+         * the provider's `ProviderInfo` honors the consumer-declared value end-to-end.
+         *
+         * Branches the API-33+ [PackageManager.ComponentInfoFlags] overload (the pre-33
+         * `getProviderInfo(ComponentName, Int)` is deprecated on 33+; the library is warnings-clean, so
+         * branch it). A missing provider ([PackageManager.NameNotFoundException]) or an absent key both
+         * resolve to `null`, preserving the D-02a safety net (an omitted meta-data still resolves
+         * `caltracker.db`).
          */
         private fun readDatabaseName(context: Context): String? = try {
             val flags = PackageManager.GET_META_DATA
-            val ai = if (Build.VERSION.SDK_INT >= 33) {
-                context.packageManager.getApplicationInfo(
-                    context.packageName,
-                    PackageManager.ApplicationInfoFlags.of(flags.toLong()),
+            val component = ComponentName(context.packageName, STARTUP_PROVIDER_CLASS)
+            val pi = if (Build.VERSION.SDK_INT >= 33) {
+                context.packageManager.getProviderInfo(
+                    component,
+                    PackageManager.ComponentInfoFlags.of(flags.toLong()),
                 )
             } else {
                 @Suppress("DEPRECATION")
-                context.packageManager.getApplicationInfo(context.packageName, flags)
+                context.packageManager.getProviderInfo(component, flags)
             }
-            ai.metaData?.getString(META_DATA_DB_NAME)
+            pi.metaData?.getString(META_DATA_DB_NAME)
         } catch (_: PackageManager.NameNotFoundException) {
             null
         }
