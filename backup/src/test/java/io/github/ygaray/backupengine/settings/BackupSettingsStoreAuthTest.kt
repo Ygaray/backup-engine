@@ -92,6 +92,26 @@ class BackupSettingsStoreAuthTest {
     }
 
     @Test
+    fun clearConnectedAndOweRevoke_atomicallyClearsAndArmsRevoke() = runBlocking {
+        // D-05b: the offline-disconnect path must clear the connected account AND arm the owed-revoke
+        // flag in ONE atomic edit — a half-cleared state (email gone but grant still true, or grant
+        // cleared but revoke never armed) would strand a still-authorized-server grant that the app
+        // believes is disconnected. v1.0.0 has no single call for this (clearConnected() +
+        // setRevokePending(true) are two separate edits); plan 22-04 adds the atomic
+        // clearConnectedAndOweRevoke().
+        store.setConnected("me@example.com")
+        assertEquals("me@example.com", store.googleAccountEmail.first())
+        assertTrue(store.googleAuthGranted.first())
+
+        // RED: clearConnectedAndOweRevoke does not exist at v1.0.0 (unresolved reference).
+        store.clearConnectedAndOweRevoke()
+
+        assertNull("email must be cleared", store.googleAccountEmail.first())
+        assertFalse("granted must be cleared", store.googleAuthGranted.first())
+        assertTrue("revoke-pending must be armed atomically alongside the clear", store.revokePending.first())
+    }
+
+    @Test
     fun connect_persistsNoTokenMaterial() = runBlocking {
         // SC#2 (the load-bearing one): after a connect, iterate EVERY persisted preference and assert
         // nothing holds token material — no "ya29." access-token, no bearer substring, and no key
