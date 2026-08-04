@@ -294,6 +294,51 @@ class BackupSettingsStore(
         }
     }
 
+    // ---- Phase 75 (ENGINE-01/02, D-01/D-02): media-restore-pending + media-backup-warning flags ----
+
+    /**
+     * True when a media restore has been staged and is awaiting reconcile. Mirrors [restorePending]
+     * but is a fully INDEPENDENT flag (D-01) — a missing/failed media pairing never blocks or fails
+     * the DB restore, and clearing this flag never touches [RESTORE_PENDING]. Corrupt/absent → false
+     * (T-15-08). Deliberately has NO companion staged-path key (unlike [restorePending]'s
+     * [restoreStagedPath]/[restoreSafetyPath]): the media-staged sibling paths are derivable from
+     * `config.mediaDirectories` at reconcile time (post-Hilt, config is injected), whereas the DB's
+     * pre-Hilt `RestoreSwapInitializer` has no `BackupConfig` available at all and must persist the
+     * path.
+     */
+    val mediaRestorePending: Flow<Boolean> = dataStore.data.map { prefs ->
+        runCatching { prefs[MEDIA_RESTORE_PENDING] ?: false }.getOrDefault(false)
+    }
+
+    /** Arm a pending media restore (D-01). No staged-path argument — see [mediaRestorePending] KDoc. */
+    suspend fun setPendingMediaRestore() {
+        dataStore.edit { it[MEDIA_RESTORE_PENDING] = true }
+    }
+
+    /** Clear the pending-media-restore flag once the media leg has reconciled (or been abandoned). */
+    suspend fun clearPendingMediaRestore() {
+        dataStore.edit { it.remove(MEDIA_RESTORE_PENDING) }
+    }
+
+    /**
+     * True when a media archive failed to back up on an otherwise-successful backup and the warning
+     * has not yet been dismissed (ENGINE-01, D-02). A durable twin of the in-memory
+     * [io.github.ygaray.backupengine.model.MediaWarning] result marker — persisted so a SCHEDULED
+     * (WorkManager) backup that drops media is never silent;
+     * it surfaces on next app/backup-screen open regardless of manual vs. scheduled path. Mirrors
+     * [needsReauth] exactly (boolean-only, no companion key). Corrupt/absent → false (T-15-08).
+     */
+    val mediaBackupWarning: Flow<Boolean> = dataStore.data.map { prefs ->
+        runCatching { prefs[MEDIA_BACKUP_WARNING] ?: false }.getOrDefault(false)
+    }
+
+    /** Arm/disarm the media-backup-warning flag (ENGINE-01, D-02). Mirrors [setNeedsReauth]. */
+    suspend fun setMediaBackupWarning(warning: Boolean) {
+        dataStore.edit {
+            if (warning) it[MEDIA_BACKUP_WARNING] = true else it.remove(MEDIA_BACKUP_WARNING)
+        }
+    }
+
     companion object {
         private val LOCAL_SAF_TREE_URI = stringPreferencesKey("local_saf_tree_uri")
         private val LAST_LOCAL_BACKUP_AT = longPreferencesKey("last_local_backup_at")
@@ -320,6 +365,11 @@ class BackupSettingsStore(
         private val LOCAL_BACKUP_FREQUENCY = stringPreferencesKey("local_backup_frequency")
         private val DRIVE_BACKUP_FREQUENCY = stringPreferencesKey("drive_backup_frequency")
         private val NEEDS_REAUTH = booleanPreferencesKey("needs_reauth")
+
+        // Phase 75 (ENGINE-01/02, D-01/D-02): media-restore-pending + media-backup-warning flags.
+        // Deliberately NO staged-path key alongside MEDIA_RESTORE_PENDING — see its KDoc.
+        private val MEDIA_RESTORE_PENDING = booleanPreferencesKey("media_restore_pending")
+        private val MEDIA_BACKUP_WARNING = booleanPreferencesKey("media_backup_warning")
     }
 }
 
