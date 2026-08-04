@@ -382,7 +382,14 @@ open class BackupRepository @Inject constructor(
             val liveDb = config.databaseFile
             val marker = File(liveDb.path + RestoreSwapInitializer.MARKER_SUFFIX)
             // Marker present == swap still armed/pending -> do NOT tear down the hand-off.
-            if (!settings.restorePending.first() || marker.exists()) return
+            //
+            // ENGINE-02 (D-01, deviation): this MUST be a LOCAL `return@runCatching`, not a bare
+            // `return`. `runCatching` is inline, so a bare `return` here is a non-local return that
+            // exits reconcilePendingRestore() ENTIRELY — before v1.2.0 this was harmless (nothing
+            // followed the DB leg), but now the independent media leg below would be silently
+            // skipped whenever the DB leg's own guard is false, breaking D-01's "the media flag is
+            // fully independent" contract. The DB leg's own observable behavior is unchanged.
+            if (!settings.restorePending.first() || marker.exists()) return@runCatching
             // Swap completed at cold start: reclaim the durable copies and clear the flag.
             File(liveDb.path + RestoreSwapInitializer.SAFETY_SUFFIX).delete()
             File(liveDb.path + RestoreSwapInitializer.STAGED_SUFFIX).delete()
@@ -392,6 +399,35 @@ open class BackupRepository @Inject constructor(
             // (a `.safety`/`.staged` deleted while `RESTORE_PENDING` is still true) must leave a
             // diagnostic trail. The durable state is intentionally left untouched for a later retry.
             Log.w(TAG, "reconcilePendingRestore failed; durable restore state left for retry", it)
+        }
+
+        // ENGINE-02 (D-01 A′ hybrid): the media leg — an INDEPENDENT runCatching so a media-leg
+        // failure NEVER prevents or undoes the DB leg's reclaim above, and vice versa (the DB leg has
+        // already run and returned by the time this begins). Own durable flag, own guard.
+        if (config.mediaDirectories.isEmpty()) return
+        runCatching {
+            if (!settings.mediaRestorePending.first()) return@runCatching
+            var allFinalized = true
+            for (dir in config.mediaDirectories) {
+                val staged = File(dir.parentFile, dir.name + MEDIA_STAGED_SUFFIX)
+                if (!staged.exists()) continue // nothing staged for this dir — already finalized or never staged
+                dir.deleteRecursively()
+                if (!staged.renameTo(dir)) {
+                    // Cross-filesystem rename can fail. Unlike DatabaseFileManager.kt:181-185's
+                    // single-FILE fallback, `staged`/`dir` here are DIRECTORY TREES — File.copyTo()
+                    // only creates an empty target directory shell, it does NOT copy contents
+                    // recursively, so mirroring DatabaseFileManager's copyTo()+delete() literally
+                    // would silently drop every staged file. copyRecursively() is the correct
+                    // directory-tree analog of that same copy-then-delete-source shape.
+                    staged.copyRecursively(dir, overwrite = true)
+                    staged.deleteRecursively()
+                }
+                if (dir.exists()) staged.deleteRecursively() else allFinalized = false
+            }
+            // Clear ONLY when every configured directory finalized — idempotent retry otherwise (D-01).
+            if (allFinalized) settings.clearPendingMediaRestore()
+        }.onFailure {
+            Log.w(TAG, "reconcilePendingRestore (media leg) failed; left for retry", it)
         }
     }
 
