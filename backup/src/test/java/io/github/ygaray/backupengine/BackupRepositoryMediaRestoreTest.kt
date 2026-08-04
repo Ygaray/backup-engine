@@ -9,6 +9,7 @@ import io.github.ygaray.backupengine.model.BackupRef
 import io.github.ygaray.backupengine.model.BackupResult
 import io.github.ygaray.backupengine.settings.BackupSettingsStore
 import io.github.ygaray.backupengine.source.BackupSource
+import io.github.ygaray.backupengine.startup.RestoreSwapInitializer
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -146,6 +147,120 @@ class BackupRepositoryMediaRestoreTest {
         assertTrue("an extract rejection must not change the DB restore's own outcome", result is BackupResult.Failure)
         assertEquals(BackupResult.Reason.WriteFailed, (result as BackupResult.Failure).reason)
         assertFalse("a rejected archive must not arm the flag", settings.mediaRestorePending.first())
+    }
+
+    // --- Task 2: reconcilePendingRestore() media leg ---
+
+    @Test
+    fun `reconcile finalizes the staged media sibling into place and clears the flag`() = runBlocking {
+        val mediaDir = File(scratch, "album_images")
+        val staged = File(scratch, "album_images.media-staged").apply { mkdirs() }
+        File(staged, "photo.jpg").writeText("photo-bytes")
+
+        val settings = BackupSettingsStore(InMemoryDataStore())
+        settings.setPendingMediaRestore()
+        val repo = repoWith(FakeRestoreSource(scratch), settings, mediaDirs = listOf(mediaDir))
+
+        repo.reconcilePendingRestore()
+
+        assertTrue("the live dir must now contain the finalized content", File(mediaDir, "photo.jpg").exists())
+        assertFalse("the staged sibling must be gone after finalize", staged.exists())
+        assertFalse("the flag must clear only once every configured directory finalized", settings.mediaRestorePending.first())
+    }
+
+    @Test
+    fun `reconcile is a no-op when mediaRestorePending is false`() = runBlocking {
+        val mediaDir = File(scratch, "album_images")
+        val staged = File(scratch, "album_images.media-staged").apply { mkdirs() }
+        File(staged, "photo.jpg").writeText("photo-bytes")
+
+        val settings = BackupSettingsStore(InMemoryDataStore()) // never armed
+        val repo = repoWith(FakeRestoreSource(scratch), settings, mediaDirs = listOf(mediaDir))
+
+        repo.reconcilePendingRestore()
+
+        assertTrue("an un-armed flag must leave the staged sibling untouched", staged.exists())
+        assertFalse("the live dir must stay untouched", File(mediaDir, "photo.jpg").exists())
+    }
+
+    @Test
+    fun `a partial finalize failure leaves the flag armed for an idempotent retry`() = runBlocking {
+        // dirA finalizes normally; dirB's PARENT is made unwritable so both its same-fs renameTo AND
+        // its copyRecursively fallback (which must mkdirs a fresh target when dirB doesn't yet exist)
+        // fail — this aborts the whole media leg via the outer runCatching, proving the flag is left
+        // armed rather than cleared on a PARTIAL success (D-01).
+        val dirA = File(scratch, "album_images")
+        val blockedParent = File(scratch, "blocked_parent").apply { mkdirs() }
+        val dirB = File(blockedParent, "voice")
+
+        val stagedA = File(scratch, "album_images.media-staged").apply { mkdirs() }
+        File(stagedA, "photo.jpg").writeText("photo-bytes")
+        val stagedB = File(blockedParent, "voice.media-staged").apply { mkdirs() }
+        File(stagedB, "clip.mp3").writeText("clip-bytes")
+
+        val settings = BackupSettingsStore(InMemoryDataStore())
+        settings.setPendingMediaRestore()
+        val repo = repoWith(FakeRestoreSource(scratch), settings, mediaDirs = listOf(dirA, dirB))
+
+        blockedParent.setWritable(false)
+        try {
+            repo.reconcilePendingRestore()
+
+            assertTrue(
+                "dirA (processed before dirB's failure) must have finalized",
+                File(dirA, "photo.jpg").exists(),
+            )
+            assertTrue(
+                "the flag must stay armed since dirB did not finalize (idempotent retry, D-01)",
+                settings.mediaRestorePending.first(),
+            )
+        } finally {
+            blockedParent.setWritable(true)
+        }
+
+        // Idempotent retry: dirA's staged sibling is already gone (skipped as a no-op), dirB's is
+        // still present and now finalizes with the parent writable again.
+        repo.reconcilePendingRestore()
+
+        assertTrue("dirB must finalize on the retry", File(dirB, "clip.mp3").exists())
+        assertFalse("the flag finally clears once every directory has finalized", settings.mediaRestorePending.first())
+    }
+
+    @Test
+    fun `a media-leg failure does not prevent or undo the DB leg's reclaim`() = runBlocking {
+        // Arm BOTH legs. The DB leg: restorePending true + marker ABSENT (== swap already applied at
+        // cold start), with real .safety/.staged sibling files present to reclaim (mirrors the
+        // existing DB-leg reconcile contract). The media leg: one directory whose PARENT is
+        // unwritable, forcing the media leg's runCatching to catch an exception.
+        val safetyFile = File(liveDb.path + RestoreSwapInitializer.SAFETY_SUFFIX).apply { writeText("safety") }
+        val stagedFile = File(liveDb.path + RestoreSwapInitializer.STAGED_SUFFIX).apply { writeText("staged") }
+        val markerFile = File(liveDb.path + RestoreSwapInitializer.MARKER_SUFFIX) // deliberately absent
+
+        val blockedParent = File(scratch, "blocked_parent2").apply { mkdirs() }
+        val mediaDir = File(blockedParent, "voice")
+        val staged = File(blockedParent, "voice.media-staged").apply { mkdirs() }
+        File(staged, "clip.mp3").writeText("clip-bytes")
+
+        val settings = BackupSettingsStore(InMemoryDataStore())
+        settings.setPendingRestore(stagedFile.path, safetyFile.path)
+        settings.setPendingMediaRestore()
+        val repo = repoWith(FakeRestoreSource(scratch), settings, mediaDirs = listOf(mediaDir))
+
+        blockedParent.setWritable(false)
+        try {
+            assertFalse("marker must be absent to simulate a completed cold-start swap", markerFile.exists())
+            repo.reconcilePendingRestore()
+
+            assertFalse("the DB leg must still reclaim .safety despite the media leg failing", safetyFile.exists())
+            assertFalse("the DB leg must still reclaim .staged despite the media leg failing", stagedFile.exists())
+            assertFalse("the DB leg's own flag must still clear (D-01 independence)", settings.restorePending.first())
+            assertTrue(
+                "the media leg's flag must stay armed since it failed (D-01 independence)",
+                settings.mediaRestorePending.first(),
+            )
+        } finally {
+            blockedParent.setWritable(true)
+        }
     }
 
     // --- fakes ---
