@@ -60,8 +60,12 @@ class BackupWorker(
 
         val repository = repositoryProvider()
 
-        return when (repository.runScheduledBackup(destination)) {
-            ScheduledOutcome.Success -> Result.success()
+        return when (val outcome = repository.runScheduledBackup(destination)) {
+            // ENGINE-01 (D-02, Pitfall 4): Success is a data class (carries mediaWarning) as of Phase
+            // 75 — `is` required now that it is no longer a bare-object equality match. outcome.mediaWarning
+            // is already persisted via settings.setMediaBackupWarning() inside runScheduledBackup(); no
+            // further action needed here — the flag drives the :app-side surface (Phase 77).
+            is ScheduledOutcome.Success -> Result.success()
             // A revoked grant is terminal — retrying can't re-authorize; the persisted needs_reauth
             // flag (set in runScheduledBackup) drives the :app reconnect surface instead (D-07b).
             ScheduledOutcome.NeedsReauth -> Result.failure()

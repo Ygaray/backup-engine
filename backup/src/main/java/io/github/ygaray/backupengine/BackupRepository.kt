@@ -366,15 +366,18 @@ open class BackupRepository @Inject constructor(
      * tag maps to [ScheduledOutcome.Transient] (the worker bounds retries), never a crash.
      */
     open suspend fun runScheduledBackup(destination: String): ScheduledOutcome = when (destination) {
-        DESTINATION_LOCAL -> when (backup()) {
-            is BackupResult.Success -> ScheduledOutcome.Success
+        DESTINATION_LOCAL -> when (val result = backup()) {
+            // ENGINE-01 (D-02): thread the media warning through — it was already persisted via
+            // settings.setMediaBackupWarning() inside backup()'s media leg, so nothing extra to do here.
+            is BackupResult.Success -> ScheduledOutcome.Success(mediaWarning = result.mediaWarning)
             is BackupResult.Failure -> ScheduledOutcome.Transient
         }
 
         DESTINATION_DRIVE -> when (val result = backupToDrive()) {
             is DriveBackupResult.Success -> {
                 settings.setNeedsReauth(false)
-                ScheduledOutcome.Success
+                // ENGINE-01 (D-02): same threading as the local branch, already persisted inside backupToDrive().
+                ScheduledOutcome.Success(mediaWarning = result.mediaWarning)
             }
             is DriveBackupResult.Failure -> when (result.reason) {
                 DriveBackupResult.Reason.NeedsReauth -> {
@@ -571,8 +574,19 @@ open class BackupRepository @Inject constructor(
  *    then `Result.failure()` (D-07b — no infinite battery-draining retry loop).
  */
 sealed interface ScheduledOutcome {
-    /** The scheduled backup completed and was verified. */
-    data object Success : ScheduledOutcome
+    /**
+     * The scheduled backup completed and was verified.
+     *
+     * [mediaWarning] mirrors [BackupResult.Success.mediaWarning] / [DriveBackupResult.Success.mediaWarning]
+     * (ENGINE-01, D-02): a scheduled backup whose DB leg succeeded but whose paired media archive
+     * failed still maps to [Success] — never a retriable failure — carrying this fixed, text-free
+     * marker so the un-watched scheduled path is never silently missing media. The durable
+     * `mediaBackupWarning` flag is armed by the underlying [BackupRepository.backup] /
+     * [BackupRepository.backupToDrive] call BEFORE this value is constructed; [mediaWarning] here is
+     * purely informational threading, not a second persistence point. Defaulted to `null` so a
+     * MediaWarning-free construction reads naturally as "clean success."
+     */
+    data class Success(val mediaWarning: MediaWarning? = null) : ScheduledOutcome
 
     /** A Drive 401 / null-token: the grant must be re-authorized (terminal for the worker). */
     data object NeedsReauth : ScheduledOutcome
