@@ -253,6 +253,51 @@ class MediaArchiveManagerSecurityTest {
         )
     }
 
+    // --- Backstop (75-02 truth #12): restore correctness is independent of zip-entry order ---
+
+    @Test
+    fun `extract routes entries by namespace prefix regardless of zip entry order`() = runBlocking {
+        // Build a .media.zip whose entries from two directories are DELIBERATELY interleaved and
+        // reversed — an ordering snapshot() (which groups by directory) would never produce — to
+        // prove extract() routes strictly by each entry's "<dirName>/" namespace prefix (a
+        // stagingRoots map lookup + File(stagingRoot, relativePath) construction), never by the
+        // entry's position/sequence in the stream. This is the held-out test the honest-verifier
+        // requires for the `verification: backstop` truth; code-reading alone is not accepted.
+        val albumStaging = stagingRoot("album_images")
+        val voiceStaging = stagingRoot("voice")
+
+        val albumPhoto = bytes(300)
+        val albumThumb = bytes(120)
+        val voiceClip = bytes(400)
+        val voiceMemo = bytes(180)
+
+        val archive = newArchive("shuffled.media.zip")
+        buildZip(
+            archive,
+            listOf(
+                "voice/clip.m4a" to voiceClip,          // voice first...
+                "album_images/photo.jpg" to albumPhoto, // ...then album...
+                "voice/memo.m4a" to voiceMemo,          // ...voice again (interleaved)...
+                "album_images/thumb.jpg" to albumThumb, // ...album again
+            ),
+        )
+
+        val ok = manager.extract(
+            archive = archive,
+            stagingRoots = mapOf("album_images" to albumStaging, "voice" to voiceStaging),
+            maxEntryBytes = 10_000L,
+            maxTotalBytes = 100_000L,
+        )
+        assertTrue(ok)
+
+        // Despite the mixed write order, every entry landed in the staging root named by its
+        // prefix, byte-identically — routing is by namespace, not position.
+        assertEquals(albumPhoto.toList(), File(albumStaging, "photo.jpg").readBytes().toList())
+        assertEquals(albumThumb.toList(), File(albumStaging, "thumb.jpg").readBytes().toList())
+        assertEquals(voiceClip.toList(), File(voiceStaging, "clip.m4a").readBytes().toList())
+        assertEquals(voiceMemo.toList(), File(voiceStaging, "memo.m4a").readBytes().toList())
+    }
+
     // --- Task 2: name-collision fails loud ---
 
     @Test
