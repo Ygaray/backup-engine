@@ -19,8 +19,13 @@ sealed interface BackupResult {
      * failed — it NEVER flips the verified success to a [Failure] and NEVER carries any exception text
      * (T-15-11). Defaults to `null` (no prune problem), so every existing `Success()` construction and
      * every `is BackupResult.Success` when-branch is unaffected (semver-safe MINOR bump).
+     *
+     * [mediaWarning] is the media-archiving twin (ENGINE-01 / D-02): a DB backup that succeeded but
+     * whose paired media archive failed stays a [Success], surfaced via this fixed [MediaWarning]
+     * marker — same non-fatal, no-exception-text contract as [pruneWarning]. Defaults to `null`, so
+     * every existing `Success()` construction and `is BackupResult.Success` when-branch is unaffected.
      */
-    data class Success(val pruneWarning: PruneWarning? = null) : BackupResult
+    data class Success(val pruneWarning: PruneWarning? = null, val mediaWarning: MediaWarning? = null) : BackupResult
 
     /** The operation was refused or failed; [reason] selects the fixed user-facing copy. */
     data class Failure(val reason: Reason) : BackupResult

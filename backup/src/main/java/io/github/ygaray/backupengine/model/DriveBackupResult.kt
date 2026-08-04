@@ -26,8 +26,14 @@ sealed interface DriveBackupResult {
      * and surfaced as this fixed [PruneWarning] marker, never a [Failure], never any exception text
      * (T-15-11). Defaults to `null`, so every existing `Success()` construction and `is
      * DriveBackupResult.Success` when-branch is unaffected (semver-safe MINOR bump).
+     *
+     * [mediaWarning] mirrors [BackupResult.Success.mediaWarning] (ENGINE-01 / D-02): a verified Drive
+     * DB backup whose paired media archive failed stays a [Success], surfaced via this fixed
+     * [MediaWarning] marker — same non-fatal, no-exception-text contract. Defaults to `null`, so
+     * every existing `Success()` construction and `is DriveBackupResult.Success` when-branch is
+     * unaffected.
      */
-    data class Success(val pruneWarning: PruneWarning? = null) : DriveBackupResult
+    data class Success(val pruneWarning: PruneWarning? = null, val mediaWarning: MediaWarning? = null) : DriveBackupResult
 
     /** The Drive backup was refused or failed; [reason] selects the fixed user-facing copy. */
     data class Failure(val reason: Reason) : DriveBackupResult
