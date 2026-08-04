@@ -269,6 +269,15 @@ open class BackupRepository @Inject constructor(
             settings.setPendingRestore(stagedPath, safetyPath)
             markerFile.writeText("pending")
 
+            // PHASE 2b (ENGINE-02, D-01 A′ hybrid): the gated, INDEPENDENT media restore leg — HERE,
+            // during this async call while the app is alive, BEFORE the restart request below (never
+            // in the pre-Hilt Initializer, which stays zero-line-changed). A missing/failed media
+            // pairing must NEVER block, fail, or alter the DB restore/restart above (D-01) — the
+            // entire leg is internally guarded and only ever logs.
+            if (config.mediaDirectories.isNotEmpty()) {
+                restoreMediaLeg(fetchSource, ref)
+            }
+
             // 4. Relaunch so the cold-start Initializer performs the swap on a closed DB file. On the
             //    happy path restartApp exits the process and never returns. A `false` return means no
             //    launch intent was available (WR-04): the swap is staged but NOT applied, so report
@@ -308,6 +317,45 @@ open class BackupRepository @Inject constructor(
         runCatching { File(stagedPath).delete() }
         runCatching { File(safetyPath).delete() }
         runCatching { if (candidate.exists()) candidate.delete() }
+    }
+
+    /**
+     * PHASE 2b (ENGINE-02, D-01 A′ hybrid): the gated, INDEPENDENT media restore leg. Locates the
+     * paired `<stem>.media.zip` sidecar (the SAME stem [ref]'s `.db` name resolves to, via
+     * [mediaSidecarName]) through [fetchSource.list], fetches it, and
+     * [MediaArchiveManager.extract]s it into one `.media-staged` sibling PER configured
+     * [BackupConfig.mediaDirectories] entry (`File(dir.parentFile, dir.name + MEDIA_STAGED_SUFFIX)`).
+     * On a clean extract, arms the durable, INDEPENDENT [BackupSettingsStore.setPendingMediaRestore]
+     * flag — never the DB's own `RESTORE_PENDING` (D-01's independence requirement).
+     *
+     * Fully guarded: a missing sidecar, a fetch failure, or an extract rejection (zip-slip / cap
+     * breach / malformed archive) is caught here and logged — it NEVER throws back into
+     * [restoreFrom], never touches the DB stage/flag, and never blocks the restart request that
+     * follows this call (D-01 — "a missing or failed media pairing must NOT block or fail the DB
+     * restore").
+     */
+    private suspend fun restoreMediaLeg(fetchSource: BackupSource, ref: BackupRef) {
+        runCatching {
+            val sidecarName = mediaSidecarName(ref.name)
+            val mediaRef = fetchSource.list().find { it.name == sidecarName } ?: return@runCatching
+            val archive = fetchSource.get(mediaRef)
+            try {
+                val stagingRoots = config.mediaDirectories.associate { dir ->
+                    dir.name to File(dir.parentFile, dir.name + MEDIA_STAGED_SUFFIX)
+                }
+                val extracted = mediaArchiveManager.extract(
+                    archive,
+                    stagingRoots,
+                    config.mediaMaxEntryBytes,
+                    config.mediaMaxTotalBytes,
+                )
+                if (extracted) settings.setPendingMediaRestore()
+            } finally {
+                archive.delete()
+            }
+        }.onFailure {
+            Log.w(TAG, "restore media leg failed for '${ref.name}'; DB restore unaffected (D-01)", it)
+        }
     }
 
     /**
@@ -556,6 +604,14 @@ open class BackupRepository @Inject constructor(
 
         /** The stem-paired media sidecar suffix (ENGINE-01, D-05) — `<stem>.db` -> `<stem>.media.zip`. */
         private const val MEDIA_ARCHIVE_SUFFIX = ".media.zip"
+
+        /**
+         * The restore-time staging sibling suffix (ENGINE-02, D-01 A′) — a configured media
+         * directory `dir` stages into `File(dir.parentFile, dir.name + MEDIA_STAGED_SUFFIX)`, e.g.
+         * `album_images` -> `album_images.media-staged`, same filesystem as its live counterpart so
+         * [reconcilePendingRestore]'s finalize can rename-into-place.
+         */
+        private const val MEDIA_STAGED_SUFFIX = ".media-staged"
     }
 }
 
