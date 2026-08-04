@@ -16,6 +16,7 @@ import io.github.ygaray.backupengine.ScheduledOutcome
 import io.github.ygaray.backupengine.settings.BackupSettingsStore
 import io.github.ygaray.backupengine.source.BackupSource
 import io.github.ygaray.backupengine.model.BackupRef
+import io.github.ygaray.backupengine.model.MediaWarning
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -63,8 +64,22 @@ class BackupWorkerTest {
 
     @Test
     fun success_mapsToSuccess() = runBlocking {
-        val result = buildWorker(ScheduledOutcome.Success).doWork()
+        val result = buildWorker(ScheduledOutcome.Success()).doWork()
         assertEquals(ListenableWorker.Result.success(), result)
+    }
+
+    @Test
+    fun success_withMediaWarning_stillMapsToSuccess() = runBlocking {
+        // ENGINE-01 (D-02, Pitfall 4): ScheduledOutcome.Success is a data class carrying an optional
+        // MediaWarning — the worker's `is ScheduledOutcome.Success ->` branch must still match and map
+        // to WorkManager success regardless of whether media was dropped (the flag alone drives the
+        // :app-side surface; the worker takes no separate action here).
+        val result = buildWorker(ScheduledOutcome.Success(mediaWarning = MediaWarning)).doWork()
+        assertEquals(
+            "a Success carrying a mediaWarning still maps to WorkManager success",
+            ListenableWorker.Result.success(),
+            result,
+        )
     }
 
     @Test
