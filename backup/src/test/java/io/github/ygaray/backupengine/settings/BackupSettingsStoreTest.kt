@@ -150,4 +150,57 @@ class BackupSettingsStoreTest {
         assertNull(store.restoreStagedPath.first())
         assertNull(store.restoreSafetyPath.first())
     }
+
+    // ---- Phase 75 (ENGINE-01/02, D-01/D-02): media-restore-pending + media-backup-warning flags ----
+
+    @Test
+    fun mediaRestorePending_defaultsFalse_armsAndClears() = runBlocking {
+        assertFalse(store.mediaRestorePending.first())
+
+        store.setPendingMediaRestore()
+        assertTrue(store.mediaRestorePending.first())
+
+        store.clearPendingMediaRestore()
+        assertFalse(store.mediaRestorePending.first())
+    }
+
+    @Test
+    fun mediaBackupWarning_defaultsFalse_setTrue_setFalseRemovesKey() = runBlocking {
+        assertFalse(store.mediaBackupWarning.first())
+
+        store.setMediaBackupWarning(true)
+        assertTrue(store.mediaBackupWarning.first())
+
+        store.setMediaBackupWarning(false)
+        assertFalse(store.mediaBackupWarning.first())
+    }
+
+    @Test
+    fun mediaRestorePending_isIndependentOfDbRestorePending() = runBlocking {
+        // Arming the DB restore flag must not arm the media flag, and vice versa (D-01 —
+        // two independent, structurally-parallel state machines, never coupled).
+        store.setPendingRestore(stagedPath = "/data/staged.db", safetyPath = "/data/safety.db")
+        assertTrue(store.restorePending.first())
+        assertFalse(store.mediaRestorePending.first())
+
+        store.clearPendingRestore()
+        store.setPendingMediaRestore()
+        assertTrue(store.mediaRestorePending.first())
+        assertFalse(store.restorePending.first())
+    }
+
+    @Test
+    fun mediaRestorePendingAndMediaBackupWarning_areIndependentOfEachOther() = runBlocking {
+        store.setPendingMediaRestore()
+        assertTrue(store.mediaRestorePending.first())
+        assertFalse(store.mediaBackupWarning.first())
+
+        store.setMediaBackupWarning(true)
+        assertTrue(store.mediaBackupWarning.first())
+        assertTrue(store.mediaRestorePending.first())
+
+        store.clearPendingMediaRestore()
+        assertFalse(store.mediaRestorePending.first())
+        assertTrue("clearing the restore flag must not disturb the independent warning flag", store.mediaBackupWarning.first())
+    }
 }
