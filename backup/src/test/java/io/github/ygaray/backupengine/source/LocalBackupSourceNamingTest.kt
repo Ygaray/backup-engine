@@ -93,6 +93,35 @@ class LocalBackupSourceNamingTest {
         )
     }
 
+    // --- ENGINE-01 (D-05, Pitfall 7) — the .media.zip sidecar clause, plan 75-03 Task 3 ---
+
+    @Test
+    fun `canonical media zip sidecar name is recognized`() {
+        // The stem-paired sidecar (D-05): same "<appName>-<ts>" stem, ".media.zip" instead of ".db".
+        assertTrue(
+            "a canonical caltracker-<ts>.media.zip sidecar must be recognized",
+            source.isBackupName("caltracker-2026-07-01_1430.media.zip"),
+        )
+    }
+
+    @Test
+    fun `SAF MIME-suffixed media zip sidecar is recognized (contains, not exact suffix)`() {
+        // Pitfall 7 — the same SAF MIME-derived-extension quirk the .db marker already guards against
+        // could in principle also append a suffix onto ".media.zip"; .contains (not .endsWith) covers it.
+        assertTrue(
+            "a SAF MIME-suffixed caltracker-x.media.zip.bin must still be recognized",
+            source.isBackupName("caltracker-x.media.zip.bin"),
+        )
+    }
+
+    @Test
+    fun `foreign-app media zip sidecar name is NOT recognized`() {
+        assertFalse(
+            "a foreign-app .media.zip name must not be recognized under the caltracker-derived prefix",
+            source.isBackupName("other-app-1.media.zip"),
+        )
+    }
+
     // --- fakes (mirrors RetentionPruneTest's scaffold; do NOT reinvent) ---
 
     private class FakeBackupConfig : BackupConfig {
