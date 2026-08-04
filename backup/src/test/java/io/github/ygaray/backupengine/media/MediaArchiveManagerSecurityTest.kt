@@ -114,7 +114,7 @@ class MediaArchiveManagerSecurityTest {
         val ok = manager.extract(
             archive = archive,
             stagingRoots = mapOf("album_images" to staging),
-            maxEntryBytes = 10_000L,
+            maxEntryBytes = 3000L, // each entry (1000B) fits; only the cumulative total is exceeded
             maxTotalBytes = 3000L,
         )
 
