@@ -45,7 +45,10 @@ import java.util.concurrent.TimeUnit
  * @param cacheDir the app cache dir; downloads stage into `backup-staging/` under it (mirrors
  *   `LocalBackupSource.stagingDir()` so the returned File feeds `BackupRepository.restore()` identically).
  * @param baseUrl the Drive API host; overridable so the JVM MockWebServer suite points at its own base.
- * @param client the shared OkHttp client (default: one with a 30s call timeout).
+ * @param client the shared OkHttp client (default: one with a 120s call timeout, D-04/Pitfall 6 — raised
+ *   from a stale 30s default so direct construction stays consistent with the production-wired client
+ *   [io.github.ygaray.backupengine.di.BackupModule.provideOkHttpClient], which is the one that actually
+ *   matters at runtime).
  */
 // `open` so the JVM test suite for DriveBackupSource can subclass it as a lightweight fake (assert the
 // find-or-create / upload-verify / list-newest-first / download / delete delegation) without hitting a
@@ -55,8 +58,8 @@ open class DriveClient(
     private val cacheDir: File,
     private val baseUrl: String = "https://www.googleapis.com",
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .callTimeout(30, TimeUnit.SECONDS)
-        .connectTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .connectTimeout(120, TimeUnit.SECONDS)
         .build(),
 ) {
 

@@ -177,13 +177,18 @@ open class LocalBackupSource(
      * NOT a hardcoded `"caltracker-"`. For CalTracker's `appName == "caltracker"` this yields
      * `"caltracker" + "-" == "caltracker-"` — BYTE-IDENTICAL to the v1.0.0 hardcoded PREFIX, so every
      * existing `caltracker-*.db` backup stays recognized/listed/restorable.
+     *
+     * **ENGINE-01 (D-05, Pitfall 7):** also recognizes the stem-paired `.media.zip` sidecar via the
+     * SAME `.contains` (not `.endsWith`) convention as the `.db` marker — cheap insurance against the
+     * same class of SAF MIME-derived-extension quirk the `.db` marker already guards against.
      */
     internal fun isBackupName(name: String): Boolean =
-        name.startsWith(config.appName + "-") && name.contains(DB_MARKER)
+        name.startsWith(config.appName + "-") && (name.contains(DB_MARKER) || name.contains(MEDIA_MARKER))
 
     companion object {
         private const val MIME_DB = "application/octet-stream"
         private const val DB_MARKER = ".db"
+        private const val MEDIA_MARKER = ".media.zip"
     }
 }
 

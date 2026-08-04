@@ -56,14 +56,17 @@ object BackupModule {
 
     /**
      * ONE shared [OkHttpClient] for the whole engine (RESEARCH Pattern 2) — a client-per-call would
-     * leak the connection pool/threads. A 30s call/connect timeout so a hung network becomes a mapped
-     * [DriveClient] failure, not an indefinite spinner.
+     * leak the connection pool/threads. This is the PRODUCTION-WIRED client (D-04, Pitfall 6): the
+     * call/connect timeout reads [BackupConfig.driveCallTimeoutSeconds] (120s default) instead of a
+     * hardcoded 30s, so a legitimate multi-hundred-MB media sidecar upload no longer aborts early
+     * while a genuinely hung network still becomes a mapped [DriveClient] failure, not an indefinite
+     * spinner.
      */
     @Provides
     @Singleton
-    fun provideOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
-        .callTimeout(30, TimeUnit.SECONDS)
-        .connectTimeout(30, TimeUnit.SECONDS)
+    fun provideOkHttpClient(config: BackupConfig): OkHttpClient = OkHttpClient.Builder()
+        .callTimeout(config.driveCallTimeoutSeconds, TimeUnit.SECONDS)
+        .connectTimeout(config.driveCallTimeoutSeconds, TimeUnit.SECONDS)
         .build()
 
     /** The hand-rolled Drive REST client (Plan 01), built from the shared client + [BackupConfig]. */
