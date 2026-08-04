@@ -4,9 +4,11 @@ import android.content.Context
 import android.util.Log
 import io.github.ygaray.backupengine.di.DriveSource
 import io.github.ygaray.backupengine.drive.DriveException
+import io.github.ygaray.backupengine.media.MediaArchiveManager
 import io.github.ygaray.backupengine.model.BackupRef
 import io.github.ygaray.backupengine.model.BackupResult
 import io.github.ygaray.backupengine.model.DriveBackupResult
+import io.github.ygaray.backupengine.model.MediaWarning
 import io.github.ygaray.backupengine.model.PruneWarning
 import io.github.ygaray.backupengine.settings.BackupSettingsStore
 import io.github.ygaray.backupengine.source.BackupSource
@@ -47,6 +49,13 @@ open class BackupRepository @Inject constructor(
 ) {
 
     /**
+     * The gated media snapshot/extract engine (ENGINE-01/02/03, D-05). Stateless (no constructor
+     * dependencies), so it is constructed here directly rather than Hilt-injected — this keeps the
+     * `BackupRepository` constructor shape UNCHANGED (every existing test/DI call site is unaffected).
+     */
+    private val mediaArchiveManager = MediaArchiveManager()
+
+    /**
      * BACKUP flow (BAK-02, BAK-04): snapshot the live DB to a checkpointed single file, [BackupSource.put]
      * it into the destination under a collision-free timestamped name, verify, and record the result.
      *
@@ -59,6 +68,9 @@ open class BackupRepository @Inject constructor(
         // WR-02: hoist temp out of the try so a `finally` can always reclaim it — a failed source.put
         // must not leak a full-size snapshot-*.db in backup-temp.
         val temp = File(tempDir(), "snapshot-$now.db")
+        // ENGINE-01 (D-02, D-05): hoisted alongside `temp` so the SAME `finally` always reclaims a
+        // partial/leftover media snapshot — mirrors WR-02's exact reclaim discipline.
+        val mediaTemp = File(tempDir(), "media-$now.zip")
         try {
             val snapped = fileManager.snapshot(config.databaseFile, temp)
             if (!snapped) {
@@ -70,6 +82,18 @@ open class BackupRepository @Inject constructor(
             val written = source.put(temp, name)
 
             settings.recordLocalBackupResult(now, ok = true)
+
+            // ENGINE-01 (D-02, D-05): gated media leg — CalTracker (empty mediaDirectories) executes
+            // NONE of this, staying byte-identical. On a non-empty config, snapshot + put a
+            // stem-paired "<stem>.media.zip" sidecar through the SAME unmodified source.put seam. A
+            // media failure NEVER downgrades the already-recorded DB success above (D-02) — it only
+            // arms the durable MediaWarning.
+            val mediaWarning = if (config.mediaDirectories.isNotEmpty()) {
+                backupMediaLeg(source, name, mediaTemp)
+            } else {
+                null
+            }
+
             // Retention (SCH-04, D-01c): prune AFTER the verified success is recorded. WR-01: exclude the
             // just-written ref by IDENTITY, not by positional index 0 — SAF `lastModified()` granularity can
             // tie the fresh file with a same-second existing one, and on a tie the new file is not guaranteed
@@ -83,7 +107,7 @@ open class BackupRepository @Inject constructor(
             val pruneWarning = runCatching {
                 prune(source, config.retentionCount, written)
             }.exceptionOrNull()?.let { PruneWarning }
-            BackupResult.Success(pruneWarning)
+            BackupResult.Success(pruneWarning, mediaWarning)
         } catch (e: FolderUnavailableException) {
             // A missing/un-granted SAF destination is its own fixed reason, still never rethrown.
             settings.recordLocalBackupResult(now, ok = false)
@@ -92,8 +116,9 @@ open class BackupRepository @Inject constructor(
             settings.recordLocalBackupResult(now, ok = false)
             BackupResult.Failure(BackupResult.Reason.WriteFailed)
         } finally {
-            // WR-02: always reclaim the temp snapshot — on success, on a failed put, on any throw.
+            // WR-02: always reclaim the temp snapshots — on success, on a failed put, on any throw.
             temp.delete()
+            mediaTemp.delete()
         }
     }
 
@@ -115,6 +140,8 @@ open class BackupRepository @Inject constructor(
         val now = System.currentTimeMillis()
         // Mirror backup()'s hoist-out-of-try so `finally` always reclaims the snapshot temp.
         val temp = File(tempDir(), "snapshot-drive-$now.db")
+        // ENGINE-01 (D-02, D-05): the Drive twin of backup()'s hoisted mediaTemp.
+        val mediaTemp = File(tempDir(), "media-drive-$now.zip")
         try {
             val snapped = fileManager.snapshot(config.databaseFile, temp)
             if (!snapped) {
@@ -122,9 +149,19 @@ open class BackupRepository @Inject constructor(
                 return@withContext DriveBackupResult.Failure(DriveBackupResult.Reason.Failed)
             }
 
-            val written = driveSource.put(temp, driveBackupName(now))
+            val name = driveBackupName(now)
+            val written = driveSource.put(temp, name)
 
             settings.recordDriveBackupResult(now, ok = true)
+
+            // ENGINE-01 (D-02, D-05): the Drive twin of backup()'s gated media leg — same gate, same
+            // stem-pairing, same never-downgrade-the-DB-Success contract, just against driveSource.
+            val mediaWarning = if (config.mediaDirectories.isNotEmpty()) {
+                backupMediaLeg(driveSource, name, mediaTemp)
+            } else {
+                null
+            }
+
             // Retention (SCH-04, D-01c): prune the DRIVE listing after the verified success, same
             // post-put/no-rollback contract as the local path. WR-01: exclude the just-written ref by
             // identity rather than positional index 0 (see backup() for the tie-ordering rationale).
@@ -135,7 +172,7 @@ open class BackupRepository @Inject constructor(
             val pruneWarning = runCatching {
                 prune(driveSource, config.retentionCount, written)
             }.exceptionOrNull()?.let { PruneWarning }
-            DriveBackupResult.Success(pruneWarning)
+            DriveBackupResult.Success(pruneWarning, mediaWarning)
         } catch (e: DriveException) {
             settings.recordDriveBackupResult(now, ok = false)
             DriveBackupResult.Failure(e.kind.toDriveReason())
@@ -144,6 +181,7 @@ open class BackupRepository @Inject constructor(
             DriveBackupResult.Failure(DriveBackupResult.Reason.Failed)
         } finally {
             temp.delete()
+            mediaTemp.delete()
         }
     }
 
@@ -375,16 +413,75 @@ open class BackupRepository @Inject constructor(
     suspend fun prune(source: BackupSource, keepN: Int, justWritten: BackupRef? = null) {
         require(keepN >= 1) { "retention keepN must be >= 1 to preserve the last good backup" }
         val all = source.list() // post-put listing, newest-first
+        // ENGINE-01 (D-05): a paired "<stem>.media.zip" sidecar shares its `.db`'s EXACT stem — group by
+        // stem so retention counts/deletes BACKUP OPERATIONS, not individual files, and a `.db` is never
+        // pruned without its paired `.media.zip` (or vice versa). When mediaDirectories is empty
+        // (CalTracker), every group is a singleton `[ref]` in list order — byte-identical to the
+        // pre-media prune behavior below.
+        val groups = groupByStemNewestFirst(all)
         if (justWritten == null) {
-            if (all.size <= keepN) return // no-op when at/under the window — never delete the last good backup
-            all.drop(keepN).forEach { source.delete(it) } // delete the oldest tail; a failed delete throws loudly
+            if (groups.size <= keepN) return // no-op when at/under the window — never delete the last good backup
+            groups.drop(keepN).forEach { group -> group.forEach { source.delete(it) } } // oldest tail; a failed delete throws loudly
             return
         }
-        // Never a delete candidate: the just-written ref is protected by identity regardless of sort ties.
-        val others = all.filterNot { it.ref == justWritten.ref }
+        // Never a delete candidate: the just-written STEM (its .db and any paired .media.zip) is
+        // protected by identity regardless of sort ties.
+        val others = groups.filterNot { group -> group.any { it.ref == justWritten.ref } }
         if (others.size <= keepN - 1) return // the new file + everything else already fits the window
-        others.drop(keepN - 1).forEach { source.delete(it) } // delete the oldest tail; a failed delete throws loudly
+        others.drop(keepN - 1).forEach { group -> group.forEach { source.delete(it) } } // oldest tail; a failed delete throws loudly
     }
+
+    /**
+     * Group [refs] by their `.db`/`.media.zip` stem (D-05), preserving each stem's FIRST-APPEARANCE
+     * position in the already-newest-first [refs] listing. A backup op's `.db` and its paired
+     * `.media.zip` are written moments apart in the same run, so their timestamps are effectively
+     * identical and they land adjacent (or near-adjacent) in the newest-first listing — first-appearance
+     * order is therefore a faithful newest-first GROUP ordering. When `refs` contains only `.db` entries
+     * (CalTracker's empty `mediaDirectories`), every group is a singleton and this is a no-op reshape.
+     */
+    private fun groupByStemNewestFirst(refs: List<BackupRef>): List<List<BackupRef>> {
+        val byStem = LinkedHashMap<String, MutableList<BackupRef>>()
+        for (ref in refs) {
+            byStem.getOrPut(stemOf(ref.name)) { mutableListOf() } += ref
+        }
+        return byStem.values.toList()
+    }
+
+    /** The backup-op stem for a `<stem>.db` or `<stem>.media.zip` name (D-05) — else [name] unchanged. */
+    private fun stemOf(name: String): String = when {
+        name.endsWith(MEDIA_ARCHIVE_SUFFIX) -> name.removeSuffix(MEDIA_ARCHIVE_SUFFIX)
+        name.endsWith(".db") -> name.removeSuffix(".db")
+        else -> name
+    }
+
+    /**
+     * The gated media backup leg (ENGINE-01, D-02, D-05): snapshot [config.mediaDirectories] to
+     * [mediaTemp], then [BackupSource.put] it into [destSource] under the SAME stem [dbName] the
+     * caller just wrote the `.db` under, producing a stem-paired `<stem>.media.zip` sidecar through
+     * the UNMODIFIED source seam. Wrapped end-to-end in `runCatching` (the module's non-throwing-
+     * boundary posture, mirrors [reconcilePendingRestore]'s leg guards) — ANY failure (a snapshot that
+     * returns `false`, or a throwing `put`) arms the durable [BackupSettingsStore.setMediaBackupWarning]
+     * flag and returns a [MediaWarning] WITHOUT ever throwing back into the caller, so the
+     * already-recorded DB success is never touched (D-02's core invariant).
+     */
+    private suspend fun backupMediaLeg(destSource: BackupSource, dbName: String, mediaTemp: File): MediaWarning? {
+        val result = runCatching {
+            val snapped = mediaArchiveManager.snapshot(config.mediaDirectories, mediaTemp)
+            check(snapped) { "media snapshot failed" }
+            destSource.put(mediaTemp, mediaSidecarName(dbName))
+        }
+        return if (result.isSuccess) {
+            settings.setMediaBackupWarning(false)
+            null
+        } else {
+            Log.w(TAG, "media backup leg failed for '$dbName'; DB backup unaffected (D-02)", result.exceptionOrNull())
+            settings.setMediaBackupWarning(true)
+            MediaWarning
+        }
+    }
+
+    /** The stem-paired sidecar name for a `<stem>.db` (D-05): `<stem>.media.zip`. */
+    private fun mediaSidecarName(dbName: String): String = dbName.removeSuffix(".db") + MEDIA_ARCHIVE_SUFFIX
 
     private fun tempDir(): File =
         File(config.databaseFile.parentFile, "backup-temp").apply { mkdirs() }
@@ -453,6 +550,9 @@ open class BackupRepository @Inject constructor(
          */
         const val DESTINATION_LOCAL = "LOCAL"
         const val DESTINATION_DRIVE = "DRIVE"
+
+        /** The stem-paired media sidecar suffix (ENGINE-01, D-05) — `<stem>.db` -> `<stem>.media.zip`. */
+        private const val MEDIA_ARCHIVE_SUFFIX = ".media.zip"
     }
 }
 
