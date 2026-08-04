@@ -121,4 +121,42 @@ interface BackupConfig {
      * last good backup by lowering this.
      */
     val retentionCount: Int get() = 5
+
+    /**
+     * Directories snapshotted/restored alongside [databaseFile] (ENGINE-01, D-06).
+     *
+     * GENERIC and config-driven — the `:backup` engine never hardcodes a host's media layout.
+     * Defaulted to `emptyList()` so existing host impls (e.g. CalTracker, which never populates
+     * this) and the JVM test fakes keep compiling with no change and stay byte-identical at
+     * runtime: with an empty list, no media branch anywhere in the engine is reachable (D-06,
+     * the load-bearing non-breaking invariant for this phase).
+     */
+    val mediaDirectories: List<File> get() = emptyList()
+
+    /**
+     * Per-entry decompressed byte cap enforced while extracting a media archive (ENGINE-03, D-03).
+     *
+     * Defaulted to 500 MiB — raised from an earlier 100 MiB baseline that predates video-capable
+     * hosts (a ~20s 4K clip already exceeds 100 MiB). `BackupConfig`-overridable so a host with
+     * different needs is never stuck with this default.
+     */
+    val mediaMaxEntryBytes: Long get() = 500L * 1024 * 1024
+
+    /**
+     * Total decompressed byte cap across all entries in a media archive (ENGINE-03, D-03).
+     *
+     * Defaulted to 8 GiB — large enough to cover a years-old media-rich library without a host
+     * needing to override just to restore its own backup, while still bounding a genuine
+     * zip-bomb. `BackupConfig`-overridable.
+     */
+    val mediaMaxTotalBytes: Long get() = 8L * 1024 * 1024 * 1024
+
+    /**
+     * The Drive HTTP call/connect timeout in seconds (ENGINE-01, D-04).
+     *
+     * Defaulted to 120s — raised from a hardcoded 30s that would time out a multi-hundred-MB
+     * media upload/download regardless of the engine's existing streaming transfer.
+     * `BackupConfig`-overridable.
+     */
+    val driveCallTimeoutSeconds: Long get() = 120L
 }
