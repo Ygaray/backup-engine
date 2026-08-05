@@ -85,7 +85,15 @@ open class DatabaseFileManager {
     fun verify(file: File): Boolean {
         if (!file.exists() || file.length() == 0L) return false
         return try {
-            SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            // OPEN_READWRITE (not READONLY): SQLite runs an FTS (FTS3/4/5) table's `integrity-check`
+            // as an `INSERT INTO <fts>(<fts>) VALUES('integrity-check')`, which needs a writable
+            // connection — so `PRAGMA integrity_check` on a DB containing ANY FTS virtual table (e.g.
+            // a host's full-text search index) aborts on a read-only handle with "attempt to write a
+            // readonly database", silently blocking every backup/restore of that DB. The file here is
+            // always a throwaway snapshot copy or a pre-live restore/swap target (single-file,
+            // journal_mode=DELETE, no concurrent readers), so opening it read-write for the check is
+            // safe and leaves the artifact's content unchanged.
+            SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
                 db.rawQuery("PRAGMA integrity_check", null).use { c ->
                     c.moveToFirst() && c.getString(0).equals("ok", ignoreCase = true)
                 }

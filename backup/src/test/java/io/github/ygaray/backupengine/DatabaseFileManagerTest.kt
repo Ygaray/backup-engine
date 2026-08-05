@@ -111,6 +111,9 @@ class DatabaseFileManagerTest {
         empty.createNewFile()
         assertFalse("zero-size file must fail verify", manager.verify(empty))
     }
+    // NOTE: the FTS-integrity-check regression lives in the INSTRUMENTED suite
+    // (DatabaseFileManagerFtsIntegrityTest) — Robolectric 4.14.1's bundled SQLite lacks the FTS
+    // modules, which is exactly why this device-only defect escaped this JVM suite until Phase-77 Gate-1.
 
     // --- Task 2: user_version guard, integrity refusal, atomic swap + rollback ---
 

@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.documentfile.provider.DocumentFile
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import io.github.ygaray.backupengine.BackupConfig
 import io.github.ygaray.backupengine.settings.BackupSettingsStore
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -39,6 +40,7 @@ class LocalBackupSourceTest {
     private lateinit var treeDir: File
     private lateinit var dataStore: DataStore<Preferences>
     private lateinit var settings: BackupSettingsStore
+    private lateinit var config: BackupConfig
 
     /** A source whose tree seams point at a real `file://` scratch dir (bypasses the SAF picker). */
     private lateinit var source: LocalBackupSource
@@ -52,8 +54,9 @@ class LocalBackupSourceTest {
             produceFile = { File(scratch, "prefs.preferences_pb") },
         )
         settings = BackupSettingsStore(dataStore)
+        config = FakeBackupConfig(File(scratch, "test.db"), dataStore)
 
-        source = object : LocalBackupSource(ctx, settings) {
+        source = object : LocalBackupSource(ctx, settings, config) {
             override fun hasPersistableGrant(uri: Uri): Boolean = true
             override fun resolveTree(uri: Uri): DocumentFile? = DocumentFile.fromFile(treeDir)
         }
@@ -62,6 +65,21 @@ class LocalBackupSourceTest {
     @After
     fun tearDown() {
         scratch.deleteRecursively()
+    }
+
+    /**
+     * Minimal on-device [BackupConfig]. LocalBackupSource reads it only for the backup-name prefix
+     * (ENG-02a: `isBackupName` matches `<appName>-`), so appName MUST be "caltracker" to match this
+     * suite's hard-coded `caltracker-*.db` fixtures. Restores this instrumented suite, which had not
+     * compiled since the `config` ctor param landed — that stale gap is why the FTS verify bug shipped
+     * uncaught (this suite's framework SQLite has the FTS modules the JVM/Robolectric suite lacks).
+     */
+    private class FakeBackupConfig(
+        override val databaseFile: File,
+        override val dataStore: DataStore<Preferences>,
+    ) : BackupConfig {
+        override val appName: String = "caltracker"
+        override val currentSchemaVersion: Int = 1
     }
 
     @Test
@@ -125,7 +143,7 @@ class LocalBackupSourceTest {
         // A source with NO seam overrides: the real persistedUriPermissions check runs. The persisted
         // URI was never granted, so requireWritableTree must throw FolderUnavailableException
         // rather than silently no-op (Pitfall 13, T-15-06).
-        val ungranted = LocalBackupSource(ctx, settings)
+        val ungranted = LocalBackupSource(ctx, settings, config)
         settings.setLocalSafTreeUri("content://com.example.bogus/tree/deadbeef")
         val src = File(scratch, "s.db").apply { writeBytes(byteArrayOf(1)) }
 
@@ -140,7 +158,7 @@ class LocalBackupSourceTest {
     @Test
     fun noFolderPicked_yieldsFolderUnavailable() = runBlocking {
         // No URI persisted at all → the "no SAF folder has been picked" folder-unavailable path.
-        val fresh = LocalBackupSource(ctx, settings)
+        val fresh = LocalBackupSource(ctx, settings, config)
         try {
             fresh.list()
             fail("expected FolderUnavailableException when no folder is picked")
